@@ -1,0 +1,94 @@
+name: Build and Publish Wheels
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build_wheels:
+    name: Build wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11' # Recommended baseline python version
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy onnx onnxruntime cryptography torch build wheel
+
+      - name: Fetch ONNX Runtime Headers
+        run: |
+          python tools/fetch_headers.py
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build C++ Library
+        run: |
+          cmake --build build --config Release
+
+      - name: Copy Binary to Package (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          copy build\Release\vajra.dll python\vajra\
+
+      - name: Copy Binary to Package (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cp build/libvajra.so python/vajra/
+
+      - name: Copy Binary to Package (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cp build/libvajra.dylib python/vajra/
+
+      - name: Run Unit Tests
+        run: |
+          python -m unittest discover -s tests
+
+      - name: Build Platform Wheel
+        run: |
+          python -m build --wheel
+
+      - name: Upload Wheel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vajra-wheels-${{ matrix.os }}
+          path: dist/*.whl
+
+  publish:
+    name: Publish to PyPI
+    needs: [build_wheels]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: vajra-wheels-*
+          merge-multiple: true
+
+      - name: Publish package to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          user: __token__
+          password: ${{ secrets.PYPI_API_TOKEN }}

@@ -1,0 +1,34 @@
+# Build directories
+build/
+bin/
+obj/
+
+# Python cache and distribution files
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+eggs/
+parts/
+sdist/
+var/
+wheels/
+*.egg
+
+# Compiled dynamic libraries in python package folder (since built on CI/CD)
+python/vajraa/vajraa.dll
+python/vajraa/libvajraa.so
+python/vajraa/libvajraa.dylib
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE configuration
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.sln.docstate
