@@ -47,17 +47,17 @@ jobs:
       - name: Copy Binary to Package (Windows)
         if: matrix.os == 'windows-latest'
         run: |
-          copy build\Release\vajra.dll python\vajra\
+          copy build\Release\vajraa.dll python\vajraa\
 
       - name: Copy Binary to Package (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
-          cp build/libvajra.so python/vajra/
+          cp build/libvajraa.so python/vajraa/
 
       - name: Copy Binary to Package (macOS)
         if: matrix.os == 'macos-latest'
         run: |
-          cp build/libvajra.dylib python/vajra/
+          cp build/libvajraa.dylib python/vajraa/
 
       - name: Run Unit Tests
         run: |
@@ -70,7 +70,7 @@ jobs:
       - name: Upload Wheel Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: vajra-wheels-${{ matrix.os }}
+          name: vajraa-wheels-${{ matrix.os }}
           path: dist/*.whl
 
   publish:
@@ -84,7 +84,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
-          pattern: vajra-wheels-*
+          pattern: vajraa-wheels-*
           merge-multiple: true
 
       - name: Publish package to PyPI
