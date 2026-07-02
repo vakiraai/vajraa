@@ -7,6 +7,8 @@ import gc
 import ctypes
 from .crypto import decrypt_tensor, SecurityError
 from .compiler import derive_permutation_and_scales
+from .activation import verify_active_lease, run_activation_flow
+import os
 from .pal import (
     pal_alloc_secure,
     pal_unlock,
@@ -201,13 +203,32 @@ class VajraaMemoryPool:
 
 _active_leases = {}
 
-def secure_wrap_model(model: nn.Module, compiled_model: dict, master_key: bytes, config: VajraaConfig = None):
+def secure_wrap_model(model: nn.Module, compiled_model: dict, master_key: bytes = None, config: VajraaConfig = None):
     """
     Wraps a PyTorch model and executes it securely based on the VajraaConfig profile.
     """
     wrapped_modules = []
     config = config or VajraaConfig()
     
+    metadata = compiled_model.get("metadata", {"max_layer_size_bytes": 0, "layer_sizes_dict": {}})
+    
+    # Resolve master_key using licensing if not passed directly
+    if not master_key:
+        license_id = metadata.get("license_id")
+        if not license_id:
+            license_id = compiled_model.get("license_id")
+            
+        if not license_id:
+            raise SecurityError("Vajraa: Model requires a valid license key or master_key to decrypt")
+            
+        server_url = os.getenv("VAJRAA_LICENSE_SERVER", "http://localhost:8000")
+        try:
+            master_key = verify_active_lease(license_id)
+        except SecurityError:
+            print(f"[Vajraa] License verification failed for model '{license_id}'. Launching activation...")
+            run_activation_flow(license_id, server_url)
+            master_key = verify_active_lease(license_id)
+            
     # Derive sub-keys
     key_crypto = hashlib.sha256(master_key + b"_crypto").digest()
     key_obfusc = hashlib.sha256(master_key + b"_obfusc").digest()
