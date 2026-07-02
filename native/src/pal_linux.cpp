@@ -8,6 +8,15 @@
 #include <time.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <vector>
+#include <random>
+#include <algorithm>
+
+struct CppMemorySlot {
+    void* ptr;
+    size_t size;
+    bool in_use;
+};
 
 extern "C" {
 
@@ -139,6 +148,143 @@ bool pal_retrieve_key(uint8_t* buf, size_t len) {
         buf[i] = g_share1[i] ^ g_share2[i];
     }
     return true;
+}
+
+// ==========================================
+// C++ Page Memory Pool Implementation
+// ==========================================
+static bool g_use_shuffling = false;
+static bool g_use_tiered = false;
+static size_t g_capped_pool_size = 0;
+static bool g_use_hybrid = false;
+static size_t g_max_layer_size = 0;
+static size_t g_avail_ram = 0;
+
+static std::vector<CppMemorySlot> g_pool;
+static bool g_pool_initialized = false;
+
+bool pal_configure_pool(bool use_shuffling, bool use_tiered, size_t capped_size, bool use_hybrid, size_t max_layer_size, size_t avail_ram) {
+    g_use_shuffling = use_shuffling;
+    g_use_tiered = use_tiered;
+    g_capped_pool_size = capped_size;
+    g_use_hybrid = use_hybrid;
+    g_max_layer_size = max_layer_size;
+    g_avail_ram = avail_ram;
+
+    // Determine if we should use the pool based on Hybrid Mode
+    bool use_pool = g_use_shuffling;
+    if (g_use_shuffling && g_use_hybrid) {
+        size_t pool_cost = g_max_layer_size * 4;
+        if (g_use_tiered) {
+            pool_cost = (3 * 4 * 1024 * 1024) + (2 * 32 * 1024 * 1024) + (2 * g_max_layer_size);
+        }
+        if (g_max_layer_size > g_capped_pool_size || pool_cost > (g_avail_ram * 0.20)) {
+            use_pool = false; // Fallback to standard JIT
+        }
+    }
+
+    // Clean up old pool if exists
+    for (auto& slot : g_pool) {
+        pal_free_secure(slot.ptr, slot.size);
+    }
+    g_pool.clear();
+    g_pool_initialized = false;
+
+    if (use_pool && g_max_layer_size > 0) {
+        if (g_use_tiered) {
+            // Tier 1 (Small): 4MB slots (3 slots)
+            for (int i = 0; i < 3; ++i) {
+                size_t size = 4 * 1024 * 1024;
+                void* ptr = pal_alloc_secure(size);
+                if (ptr) g_pool.push_back({ptr, size, false});
+            }
+            // Tier 2 (Medium): 32MB slots (2 slots)
+            for (int i = 0; i < 2; ++i) {
+                size_t size = 32 * 1024 * 1024;
+                void* ptr = pal_alloc_secure(size);
+                if (ptr) g_pool.push_back({ptr, size, false});
+            }
+            // Tier 3 (Large): max_layer_size slots (2 slots)
+            size_t large_size = g_max_layer_size;
+            if (large_size < 32 * 1024 * 1024) {
+                large_size = 32 * 1024 * 1024;
+            }
+            for (int i = 0; i < 2; ++i) {
+                void* ptr = pal_alloc_secure(large_size);
+                if (ptr) g_pool.push_back({ptr, large_size, false});
+            }
+        } else {
+            // Uniform pool: 4 slots of max_layer_size
+            for (int i = 0; i < 4; ++i) {
+                void* ptr = pal_alloc_secure(g_max_layer_size);
+                if (ptr) g_pool.push_back({ptr, g_max_layer_size, false});
+            }
+        }
+        g_pool_initialized = true;
+    }
+
+    return true;
+}
+
+void* pal_lease_secure_slot(size_t required_size, size_t* allocated_size) {
+    if (g_pool_initialized && !g_pool.empty()) {
+        std::vector<CppMemorySlot*> available;
+        for (auto& slot : g_pool) {
+            if (!slot.in_use && slot.size >= required_size) {
+                available.push_back(&slot);
+            }
+        }
+
+        if (!available.empty()) {
+            CppMemorySlot* leased = nullptr;
+            if (g_use_shuffling) {
+                // Pick a random slot
+                std::random_device rd;
+                std::mt19937 gen(rd());
+                std::uniform_int_distribution<> dis(0, static_cast<int>(available.size()) - 1);
+                leased = available[dis(gen)];
+            } else {
+                leased = available[0];
+            }
+
+            leased->in_use = true;
+            if (allocated_size) {
+                *allocated_size = leased->size;
+            }
+            // Unlock the leased slot for use
+            pal_unlock(leased->ptr, leased->size);
+            return leased->ptr;
+        }
+    }
+
+    // Fallback: Allocate dynamically
+    void* ptr = pal_alloc_secure(required_size);
+    if (ptr) {
+        pal_unlock(ptr, required_size);
+        if (allocated_size) {
+            *allocated_size = required_size;
+        }
+    }
+    return ptr;
+}
+
+void pal_release_secure_slot(void* ptr, size_t allocated_size) {
+    if (ptr == nullptr) return;
+
+    if (g_pool_initialized) {
+        for (auto& slot : g_pool) {
+            if (slot.ptr == ptr) {
+                pal_secure_zero(slot.ptr, slot.size);
+                pal_lock(slot.ptr, slot.size);
+                slot.in_use = false;
+                return;
+            }
+        }
+    }
+
+    // Fallback: Standard JIT free
+    pal_secure_zero(ptr, allocated_size);
+    pal_free_secure(ptr, allocated_size);
 }
 
 } // extern "C"

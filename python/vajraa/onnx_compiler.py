@@ -24,6 +24,7 @@ def rewrite_onnx_graph(input_path: str, output_path: str, master_key: bytes, lay
     
     # List of new nodes we will construct
     new_nodes = []
+    layer_sizes = {}
     
     # Keep track of nodes we modified
     modified_node_count = 0
@@ -73,6 +74,7 @@ def rewrite_onnx_graph(input_path: str, output_path: str, master_key: bytes, lay
                     # 4. Remove original plaintext initializer to prevent it from saving
                     graph.initializer.remove(init_tensor)
                     del initializers[weight_name]
+                    layer_sizes[weight_name] = int(weight_np.nbytes)
                     
                     # 5. Create the custom SecureGemm operator node
                     # Custom inputs: Input, Encrypted_Weights, IV, Tag, [Bias]
@@ -133,6 +135,7 @@ def rewrite_onnx_graph(input_path: str, output_path: str, master_key: bytes, lay
                     # 4. Remove original plaintext initializer to prevent it from saving
                     graph.initializer.remove(init_tensor)
                     del initializers[weight_name]
+                    layer_sizes[weight_name] = int(weight_np.nbytes)
                     
                     # 5. Create the custom SecureConv / SecureConvTranspose operator node
                     custom_inputs = [node.input[0], enc_init_name, f"{weight_name}_iv", f"{weight_name}_tag"]
@@ -164,6 +167,21 @@ def rewrite_onnx_graph(input_path: str, output_path: str, master_key: bytes, lay
     # Replace old nodes list with our rewritten list
     del graph.node[:]
     graph.node.extend(new_nodes)
+    
+    # Save metadata properties
+    import json
+    max_layer_size = max(layer_sizes.values()) if layer_sizes else 0
+    for prop in list(model.metadata_props):
+        if prop.key in ["max_layer_size_bytes", "layer_sizes_dict"]:
+            model.metadata_props.remove(prop)
+            
+    prop1 = model.metadata_props.add()
+    prop1.key = "max_layer_size_bytes"
+    prop1.value = str(max_layer_size)
+    
+    prop2 = model.metadata_props.add()
+    prop2.key = "layer_sizes_dict"
+    prop2.value = json.dumps(layer_sizes)
     
     # Save modified ONNX graph
     onnx.save(model, output_path)

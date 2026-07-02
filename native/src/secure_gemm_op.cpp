@@ -97,14 +97,15 @@ struct SecureGemmKernel {
         
         // 3. Allocate secure, page-protected buffer for the weight matrix
         size_t weight_size_bytes = out_features_ * in_features_ * sizeof(float);
-        void* decrypted_weights_ptr = pal_alloc_secure(weight_size_bytes);
+        size_t allocated_size = weight_size_bytes;
+        void* decrypted_weights_ptr = pal_lease_secure_slot(weight_size_bytes, &allocated_size);
         if (!decrypted_weights_ptr) {
             pal_secure_zero(master_key, 32);
             return;
         }
         
         // 4. Unlock page to writable and decrypt JIT
-        pal_unlock(decrypted_weights_ptr, weight_size_bytes);
+        pal_unlock(decrypted_weights_ptr, allocated_size);
         
         bool success = vajraa_decrypt_gcm(
             w_enc_data, ciphertext_len,
@@ -116,8 +117,7 @@ struct SecureGemmKernel {
         pal_secure_zero(master_key, 32);
         
         if (!success) {
-            pal_secure_zero(decrypted_weights_ptr, weight_size_bytes);
-            pal_free_secure(decrypted_weights_ptr, weight_size_bytes);
+            pal_release_secure_slot(decrypted_weights_ptr, allocated_size);
             return;
         }
         
@@ -139,16 +139,14 @@ struct SecureGemmKernel {
         OrtValue* output_y = nullptr;
         OrtStatus* status = api_->KernelContext_GetOutput(context, 0, output_shape.data(), output_shape.size(), &output_y);
         if (status != nullptr) {
-            pal_secure_zero(decrypted_weights_ptr, weight_size_bytes);
-            pal_free_secure(decrypted_weights_ptr, weight_size_bytes);
+            pal_release_secure_slot(decrypted_weights_ptr, allocated_size);
             return;
         }
         
         float* y_data = nullptr;
         status = api_->GetTensorMutableData(output_y, reinterpret_cast<void**>(&y_data));
         if (status != nullptr) {
-            pal_secure_zero(decrypted_weights_ptr, weight_size_bytes);
-            pal_free_secure(decrypted_weights_ptr, weight_size_bytes);
+            pal_release_secure_slot(decrypted_weights_ptr, allocated_size);
             return;
         }
         
@@ -182,8 +180,7 @@ struct SecureGemmKernel {
         }
         
         // 8. Wipe decrypted weights from physical RAM immediately
-        pal_secure_zero(decrypted_weights_ptr, weight_size_bytes);
-        pal_free_secure(decrypted_weights_ptr, weight_size_bytes);
+        pal_release_secure_slot(decrypted_weights_ptr, allocated_size);
     }
 
 private:
@@ -311,13 +308,14 @@ struct SecureConvKernel {
         }
         
         size_t weight_size_bytes = out_channels_ * in_channels_ * kernel_h_ * kernel_w_ * sizeof(float);
-        void* decrypted_weights_ptr = pal_alloc_secure(weight_size_bytes);
+        size_t allocated_size = weight_size_bytes;
+        void* decrypted_weights_ptr = pal_lease_secure_slot(weight_size_bytes, &allocated_size);
         if (!decrypted_weights_ptr) {
             pal_secure_zero(master_key, 32);
             return;
         }
         
-        pal_unlock(decrypted_weights_ptr, weight_size_bytes);
+        pal_unlock(decrypted_weights_ptr, allocated_size);
         
         bool success = vajraa_decrypt_gcm(
             w_enc_data, ciphertext_len,
@@ -328,8 +326,7 @@ struct SecureConvKernel {
         pal_secure_zero(master_key, 32);
         
         if (!success) {
-            pal_secure_zero(decrypted_weights_ptr, weight_size_bytes);
-            pal_free_secure(decrypted_weights_ptr, weight_size_bytes);
+            pal_release_secure_slot(decrypted_weights_ptr, allocated_size);
             return;
         }
         
@@ -352,16 +349,14 @@ struct SecureConvKernel {
         OrtValue* output_y = nullptr;
         OrtStatus* status = api_->KernelContext_GetOutput(context, 0, output_shape.data(), output_shape.size(), &output_y);
         if (status != nullptr) {
-            pal_secure_zero(decrypted_weights_ptr, weight_size_bytes);
-            pal_free_secure(decrypted_weights_ptr, weight_size_bytes);
+            pal_release_secure_slot(decrypted_weights_ptr, allocated_size);
             return;
         }
         
         float* y_data = nullptr;
         status = api_->GetTensorMutableData(output_y, reinterpret_cast<void**>(&y_data));
         if (status != nullptr) {
-            pal_secure_zero(decrypted_weights_ptr, weight_size_bytes);
-            pal_free_secure(decrypted_weights_ptr, weight_size_bytes);
+            pal_release_secure_slot(decrypted_weights_ptr, allocated_size);
             return;
         }
         
@@ -392,8 +387,7 @@ struct SecureConvKernel {
             }
         }
         
-        pal_secure_zero(decrypted_weights_ptr, weight_size_bytes);
-        pal_free_secure(decrypted_weights_ptr, weight_size_bytes);
+        pal_release_secure_slot(decrypted_weights_ptr, allocated_size);
     }
     
 private:
@@ -536,13 +530,14 @@ struct SecureConvTransposeKernel {
         }
         
         size_t weight_size_bytes = in_channels_ * out_channels_ * kernel_h_ * kernel_w_ * sizeof(float);
-        void* decrypted_weights_ptr = pal_alloc_secure(weight_size_bytes);
+        size_t allocated_size = weight_size_bytes;
+        void* decrypted_weights_ptr = pal_lease_secure_slot(weight_size_bytes, &allocated_size);
         if (!decrypted_weights_ptr) {
             pal_secure_zero(master_key, 32);
             return;
         }
         
-        pal_unlock(decrypted_weights_ptr, weight_size_bytes);
+        pal_unlock(decrypted_weights_ptr, allocated_size);
         
         bool success = vajraa_decrypt_gcm(
             w_enc_data, ciphertext_len,
@@ -553,8 +548,7 @@ struct SecureConvTransposeKernel {
         pal_secure_zero(master_key, 32);
         
         if (!success) {
-            pal_secure_zero(decrypted_weights_ptr, weight_size_bytes);
-            pal_free_secure(decrypted_weights_ptr, weight_size_bytes);
+            pal_release_secure_slot(decrypted_weights_ptr, allocated_size);
             return;
         }
         
@@ -577,16 +571,14 @@ struct SecureConvTransposeKernel {
         OrtValue* output_y = nullptr;
         OrtStatus* status = api_->KernelContext_GetOutput(context, 0, output_shape.data(), output_shape.size(), &output_y);
         if (status != nullptr) {
-            pal_secure_zero(decrypted_weights_ptr, weight_size_bytes);
-            pal_free_secure(decrypted_weights_ptr, weight_size_bytes);
+            pal_release_secure_slot(decrypted_weights_ptr, allocated_size);
             return;
         }
         
         float* y_data = nullptr;
         status = api_->GetTensorMutableData(output_y, reinterpret_cast<void**>(&y_data));
         if (status != nullptr) {
-            pal_secure_zero(decrypted_weights_ptr, weight_size_bytes);
-            pal_free_secure(decrypted_weights_ptr, weight_size_bytes);
+            pal_release_secure_slot(decrypted_weights_ptr, allocated_size);
             return;
         }
         
@@ -630,8 +622,7 @@ struct SecureConvTransposeKernel {
             }
         }
         
-        pal_secure_zero(decrypted_weights_ptr, weight_size_bytes);
-        pal_free_secure(decrypted_weights_ptr, weight_size_bytes);
+        pal_release_secure_slot(decrypted_weights_ptr, allocated_size);
     }
     
 private:

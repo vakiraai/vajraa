@@ -41,6 +41,20 @@ if IS_WINDOWS:
     PAGE_READWRITE = 0x04
     CRYPTPROTECTMEMORY_SAME_PROCESS = 0x00
     
+    # Memory Status Structure
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)
+        ]
+        
     # Types configuration
     kernel32.VirtualAlloc.restype = ctypes.c_void_p
     kernel32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
@@ -50,6 +64,9 @@ if IS_WINDOWS:
     
     kernel32.VirtualFree.restype = wintypes.BOOL
     kernel32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD]
+    
+    kernel32.GlobalMemoryStatusEx.restype = wintypes.BOOL
+    kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(MEMORYSTATUSEX)]
     
     crypt32.CryptProtectMemory.restype = wintypes.BOOL
     crypt32.CryptProtectMemory.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD]
@@ -246,3 +263,60 @@ def pal_retrieve_key() -> bytes:
         share1, share2 = _encrypted_key_buf
         return bytearray(a ^ b for a, b in zip(share1, share2))
     return bytearray()
+
+def _get_macos_avail_mem() -> int:
+    try:
+        try:
+            page_size = os.sysconf('SC_PAGESIZE')
+        except Exception:
+            page_size = 4096
+            
+        import subprocess
+        res = subprocess.run(["vm_stat"], capture_output=True, text=True, check=True)
+        free_pages = 0
+        speculative_pages = 0
+        inactive_pages = 0
+        for line in res.stdout.splitlines():
+            if "Pages free:" in line:
+                free_pages = int(line.split()[-1].replace(".", ""))
+            elif "Pages speculative:" in line:
+                speculative_pages = int(line.split()[-1].replace(".", ""))
+            elif "Pages inactive:" in line:
+                inactive_pages = int(line.split()[-1].replace(".", ""))
+        return (free_pages + speculative_pages + inactive_pages) * page_size
+    except Exception:
+        try:
+            import subprocess
+            res = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, check=True)
+            total_mem = int(res.stdout.strip())
+            return total_mem // 2
+        except Exception:
+            pass
+    return 1024 * 1024 * 1024  # Fallback to 1GB
+
+def pal_get_available_memory() -> int:
+    """
+    Returns the available physical memory (RAM) in bytes.
+    """
+    if IS_WINDOWS:
+        try:
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return stat.ullAvailPhys
+        except Exception:
+            pass
+    elif IS_LINUX:
+        try:
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+                    if line.startswith("MemFree:"):
+                        return int(line.split()[1]) * 1024
+        except Exception:
+            pass
+    elif IS_MACOS:
+        return _get_macos_avail_mem()
+        
+    return 1024 * 1024 * 1024  # Fallback to 1GB

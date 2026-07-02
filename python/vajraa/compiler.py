@@ -33,7 +33,10 @@ def compile_model_weights(state_dict: dict, master_key: bytes) -> dict:
         "encrypted_layers": {},
         "obfuscated_layers": {},
         "mixers": {},
-        "metadata": {}
+        "metadata": {
+            "max_layer_size_bytes": 0,
+            "layer_sizes_dict": {}
+        }
     }
     
     # Preserve insertion order to follow topological execution flow
@@ -58,6 +61,7 @@ def compile_model_weights(state_dict: dict, master_key: bytes) -> dict:
         # Step 1: Encrypt the critical boundaries (First & Last layers) using AES
         if name.startswith(first_layer_name.split('.')[0]) or name.startswith(last_layer_name.split('.')[0]):
             compiled_model["encrypted_layers"][name] = encrypt_tensor(weight_np, key_crypto)
+            compiled_model["metadata"]["layer_sizes_dict"][name] = int(weight_np.nbytes)
             continue
 
         # Step 2: Apply Permutation & Scaling Obfuscation to Intermediate Layers
@@ -79,6 +83,7 @@ def compile_model_weights(state_dict: dict, master_key: bytes) -> dict:
             scrambled = scrambled * s_in[np.newaxis, :]
             
             compiled_model["obfuscated_layers"][name] = encrypt_tensor(scrambled, key_crypto)
+            compiled_model["metadata"]["layer_sizes_dict"][name] = int(scrambled.nbytes)
             
             # Inject a Secret Mixer block parameters right after this layer
             # A Mixer is a tiny feed-forward net: GeLU(X * W_mix)
@@ -90,9 +95,15 @@ def compile_model_weights(state_dict: dict, master_key: bytes) -> dict:
             mixer_rng = np.random.default_rng(mixer_seed)
             w_mix = mixer_rng.normal(0, 0.01, size=(mix_size, mix_size)).astype(np.float32)
             compiled_model["mixers"][mixer_key] = encrypt_tensor(w_mix, key_crypto)
+            compiled_model["metadata"]["layer_sizes_dict"][mixer_key] = int(w_mix.nbytes)
             
         else:
             # Fallback encrypt other parameters (like biases) for security
             compiled_model["encrypted_layers"][name] = encrypt_tensor(weight_np, key_crypto)
+            compiled_model["metadata"]["layer_sizes_dict"][name] = int(weight_np.nbytes)
+
+    # Calculate max parameter size
+    sizes = compiled_model["metadata"]["layer_sizes_dict"].values()
+    compiled_model["metadata"]["max_layer_size_bytes"] = max(sizes) if sizes else 0
 
     return compiled_model

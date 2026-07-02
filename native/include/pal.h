@@ -96,6 +96,21 @@ bool pal_store_key(const uint8_t* key, size_t len);
  */
 bool pal_retrieve_key(uint8_t* buf, size_t len);
 
+/**
+ * Configures the native page memory pool.
+ */
+bool pal_configure_pool(bool use_shuffling, bool use_tiered, size_t capped_size, bool use_hybrid, size_t max_layer_size, size_t avail_ram);
+
+/**
+ * Leases a secure memory slot or allocates dynamically if pooling is disabled/fallback.
+ */
+void* pal_lease_secure_slot(size_t required_size, size_t* allocated_size);
+
+/**
+ * Releases a leased slot back to the pool, or frees it if dynamically allocated.
+ */
+void pal_release_secure_slot(void* ptr, size_t allocated_size);
+
 #ifdef __cplusplus
 }
 #endif
