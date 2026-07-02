@@ -3,17 +3,19 @@ import torch
 import torch.nn as nn
 import numpy as np
 import hashlib
-import gc
 import ctypes
-from .crypto import encrypt_tensor, decrypt_tensor
+from .crypto import encrypt_tensor, decrypt_tensor, SecurityError
 from .pal import (
     pal_alloc_secure,
     pal_unlock,
     pal_secure_zero,
     pal_free_secure,
     pal_is_debugger_attached,
-    pal_kill_if_debugged
+    pal_kill_if_debugged,
+    pal_decrypt_gcm
 )
+
+_active_leases = {}
 
 def compile_lora_weights(state_dict: dict, master_key: bytes) -> dict:
     """
@@ -30,7 +32,9 @@ def compile_lora_weights(state_dict: dict, master_key: bytes) -> dict:
                 param_np = param.numpy().copy()
             else:
                 param_np = param.copy()
-            compiled_lora[name] = encrypt_tensor(param_np, key_crypto)
+                
+            aad = f"{name}:{list(param_np.shape)}:{str(param_np.dtype)}".encode('utf-8')
+            compiled_lora[name] = encrypt_tensor(param_np, key_crypto, aad=aad)
             
     return compiled_lora
 
@@ -66,59 +70,81 @@ def secure_wrap_lora(model: nn.Module, compiled_lora_weights: dict, master_key: 
                     delattr(module, 'weight')
                 module.register_parameter('weight', None)
                 
+                w_shape = tuple(module._enc_weight["shape"])
+                w_dtype = np.dtype(module._enc_weight["dtype"])
+
                 # Register JIT hooks
-                def make_pre_hook_lora(mod_name):
+                def make_pre_hook_lora(w_k, w_sh, w_dt):
                     def pre_hook_lora(mod, input_args):
                         if pal_is_debugger_attached():
                             pal_kill_if_debugged()
                         device = input_args[0].device
                         
+                        lease = {}
+                        
                         if hasattr(mod, '_enc_weight'):
-                            # Decrypt
-                            w_np = decrypt_tensor(mod._enc_weight, key_crypto)
-                            size_bytes = w_np.nbytes
+                            import base64
+                            ciphertext = base64.b64decode(mod._enc_weight["ciphertext"])
+                            iv = base64.b64decode(mod._enc_weight["iv"])
+                            tag = base64.b64decode(mod._enc_weight["tag"])
+                            size_bytes = len(ciphertext)
                             
-                            # Secure page allocation
+                            aad = f"{w_k}:{list(w_sh)}:{str(w_dt)}".encode('utf-8')
+                            
                             ptr = pal_alloc_secure(size_bytes)
                             if ptr == 0:
                                 raise MemoryError("Vajraa: pal_alloc_secure failed for LoRA weight")
                             pal_unlock(ptr, size_bytes)
                             
-                            ctypes_array = (ctypes.c_byte * size_bytes).from_address(ptr)
-                            ctypes.memmove(ctypes_array, w_np.ctypes.data, size_bytes)
-                            shared_np = np.frombuffer(ctypes_array, dtype=w_np.dtype)
+                            success = pal_decrypt_gcm(ciphertext, key_crypto, iv, tag, aad, ptr)
+                            if not success:
+                                pal_secure_zero(ptr, size_bytes)
+                                pal_free_secure(ptr, size_bytes)
+                                raise SecurityError("Vajraa: Decryption failed for LoRA weight")
                             
-                            mod.weight_transient = torch.from_numpy(shared_np).reshape(w_np.shape).to(device)
+                            ctypes_array = (ctypes.c_byte * size_bytes).from_address(ptr)
+                            shared_np = np.frombuffer(ctypes_array, dtype=w_dt)
+                            
+                            mod.weight_transient = torch.from_numpy(shared_np).reshape(w_sh).to(device)
                             mod.weight = nn.Parameter(mod.weight_transient, requires_grad=False)
                             
-                            mod._weight_ptr = ptr
-                            mod._weight_size = size_bytes
+                            lease.update({
+                                'weight_ptr': ptr,
+                                'weight_size': size_bytes,
+                                'weight_transient': mod.weight_transient
+                            })
+                            
+                        if lease:
+                            _active_leases[id(mod)] = lease
+                            
                     return pre_hook_lora
 
-                def make_post_hook_lora(mod_name):
+                def make_post_hook_lora():
                     def post_hook_lora(mod, input_args, output):
-                        # 1. Zero PyTorch transient buffer first
-                        if hasattr(mod, 'weight_transient'):
-                            mod.weight_transient.zero_()
-                            
-                        # 2. Zero and free secure OS allocations
-                        if hasattr(mod, '_weight_ptr'):
-                            pal_secure_zero(mod._weight_ptr, mod._weight_size)
-                            pal_free_secure(mod._weight_ptr, mod._weight_size)
-                            delattr(mod, '_weight_ptr')
-                            delattr(mod, '_weight_size')
-                            
+                        lease = _active_leases.pop(id(mod), None)
+                        if lease:
+                            # 1. Zero PyTorch transient buffer first
+                            w_trans = lease.get('weight_transient')
+                            if w_trans is not None:
+                                w_trans.zero_()
+                                
+                            # 2. Zero and free secure OS allocations
+                            w_ptr = lease.get('weight_ptr')
+                            w_size = lease.get('weight_size')
+                            if w_ptr:
+                                pal_secure_zero(w_ptr, w_size)
+                                pal_free_secure(w_ptr, w_size)
+                                
                         # 3. Clean up references
+                        if hasattr(mod, 'weight'):
+                            delattr(mod, 'weight')
                         if hasattr(mod, 'weight_transient'):
-                            if hasattr(mod, 'weight'):
-                                delattr(mod, 'weight')
-                            del mod.weight_transient
+                            delattr(mod, 'weight_transient')
                             
-                        gc.collect()
                     return post_hook_lora
 
-                module.register_forward_pre_hook(make_pre_hook_lora(name))
-                module.register_forward_hook(make_post_hook_lora(name))
+                module.register_forward_pre_hook(make_pre_hook_lora(weight_key, w_shape, w_dtype))
+                module.register_forward_hook(make_post_hook_lora())
                 wrapped_adapters.append(name)
 
     return wrapped_adapters

@@ -44,8 +44,12 @@ def rewrite_onnx_graph(input_path: str, output_path: str, master_key: bytes, lay
                     init_tensor = initializers[weight_name]
                     weight_np = numpy_helper.to_array(init_tensor).copy()
                     
+                    w_shape = list(weight_np.shape)
+                    w_dtype = str(weight_np.dtype)
+                    aad = f"{weight_name}:{w_shape}:{w_dtype}".encode('utf-8')
+                    
                     # 2. Encrypt weights using AES
-                    enc_dict = encrypt_tensor(weight_np, key_crypto)
+                    enc_dict = encrypt_tensor(weight_np, key_crypto, aad=aad)
                     
                     # 3. Create a new encrypted initializer containing the ciphertext bytes
                     # We store it as a flat uint8/int8 byte array
@@ -90,7 +94,8 @@ def rewrite_onnx_graph(input_path: str, output_path: str, master_key: bytes, lay
                         domain="vajraa",
                         # Pass shape metadata as attributes
                         shape=enc_dict["shape"],
-                        dtype=enc_dict["dtype"]
+                        dtype=enc_dict["dtype"],
+                        weight_name=weight_name
                     )
                     new_nodes.append(secure_node)
                     is_modified = True
@@ -106,8 +111,12 @@ def rewrite_onnx_graph(input_path: str, output_path: str, master_key: bytes, lay
                     init_tensor = initializers[weight_name]
                     weight_np = numpy_helper.to_array(init_tensor).copy()
                     
+                    w_shape = list(weight_np.shape)
+                    w_dtype = str(weight_np.dtype)
+                    aad = f"{weight_name}:{w_shape}:{w_dtype}".encode('utf-8')
+                    
                     # 2. Encrypt weights using AES
-                    enc_dict = encrypt_tensor(weight_np, key_crypto)
+                    enc_dict = encrypt_tensor(weight_np, key_crypto, aad=aad)
                     
                     # 3. Create a new encrypted initializer containing the ciphertext bytes
                     import base64
@@ -151,7 +160,8 @@ def rewrite_onnx_graph(input_path: str, output_path: str, master_key: bytes, lay
                         domain="vajraa",
                         # Pass shape metadata as attributes
                         shape=enc_dict["shape"],
-                        dtype=enc_dict["dtype"]
+                        dtype=enc_dict["dtype"],
+                        weight_name=weight_name
                     )
                     # Copy all attributes (pads, strides, dilations, group, etc.) from standard node
                     secure_node.attribute.extend(node.attribute)

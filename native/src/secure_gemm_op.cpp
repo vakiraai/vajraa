@@ -21,16 +21,32 @@ struct SecureGemmKernel {
         out_features_ = shape_attr[0];
         in_features_ = shape_attr[1];
 
-        // Key caching configuration
-        key_retrieved_ = false;
-        memset(key_share1_, 0, 32);
-        memset(key_share2_, 0, 32);
+        // Retrieve weight_name attribute
+        size_t name_len = 0;
+        OrtStatus* status = api_->KernelInfoGetAttribute_string(info_, "weight_name", nullptr, &name_len);
+        if (status == nullptr && name_len > 0) {
+            std::vector<char> name_buf(name_len);
+            api_->KernelInfoGetAttribute_string(info_, "weight_name", name_buf.data(), &name_len);
+            weight_name_ = std::string(name_buf.data());
+        } else {
+            weight_name_ = "unknown";
+        }
+        if (status != nullptr) api_->ReleaseStatus(status);
+
+        // Retrieve dtype attribute
+        size_t dtype_len = 0;
+        status = api_->KernelInfoGetAttribute_string(info_, "dtype", nullptr, &dtype_len);
+        if (status == nullptr && dtype_len > 0) {
+            std::vector<char> dtype_buf(dtype_len);
+            api_->KernelInfoGetAttribute_string(info_, "dtype", dtype_buf.data(), &dtype_len);
+            dtype_ = std::string(dtype_buf.data());
+        } else {
+            dtype_ = "float32";
+        }
+        if (status != nullptr) api_->ReleaseStatus(status);
     }
 
-    ~SecureGemmKernel() {
-        pal_secure_zero(key_share1_, 32);
-        pal_secure_zero(key_share2_, 32);
-    }
+    ~SecureGemmKernel() {}
 
     void Compute(OrtKernelContext* context) {
         // 1. Get input tensors
@@ -74,25 +90,10 @@ struct SecureGemmKernel {
         
         int64_t batch_size = x_shape[0];
         
-        // 2. Load master key from secure memory storage (cached)
+        // 2. Load master key from secure memory storage directly (Thread-safe on stack)
         uint8_t master_key[32] = {0};
-        if (!key_retrieved_) {
-            uint8_t temp_key[32] = {0};
-            if (!pal_retrieve_key(temp_key, 32)) {
-                pal_kill_if_debugged(); // Key not found or integrity compromised
-            }
-            // Generate two shares for XOR split caching
-            for (int i = 0; i < 32; ++i) {
-                key_share1_[i] = (uint8_t)(rand() % 256);
-                key_share2_[i] = temp_key[i] ^ key_share1_[i];
-            }
-            pal_secure_zero(temp_key, 32);
-            key_retrieved_ = true;
-        }
-        
-        // Reconstruct master key from XOR shares
-        for (int i = 0; i < 32; ++i) {
-            master_key[i] = key_share1_[i] ^ key_share2_[i];
+        if (!pal_retrieve_key(master_key, 32)) {
+            pal_kill_if_debugged(); // Key not found or integrity compromised
         }
         
         // 3. Allocate secure, page-protected buffer for the weight matrix
@@ -107,9 +108,14 @@ struct SecureGemmKernel {
         // 4. Unlock page to writable and decrypt JIT
         pal_unlock(decrypted_weights_ptr, allocated_size);
         
+        // Construct Associated Authenticated Data (AAD)
+        std::string shape_str = "[" + std::to_string(out_features_) + ", " + std::to_string(in_features_) + "]";
+        std::string aad_str = weight_name_ + ":" + shape_str + ":" + dtype_;
+        
         bool success = vajraa_decrypt_gcm(
             w_enc_data, ciphertext_len,
             master_key, iv_data, tag_data,
+            reinterpret_cast<const uint8_t*>(aad_str.c_str()), aad_str.length(),
             reinterpret_cast<uint8_t*>(decrypted_weights_ptr)
         );
         
@@ -190,10 +196,8 @@ private:
     int64_t out_features_;
     int64_t in_features_;
     
-    // Cached key shares for SG2
-    bool key_retrieved_;
-    uint8_t key_share1_[32];
-    uint8_t key_share2_[32];
+    std::string weight_name_;
+    std::string dtype_;
 };
 
 // Custom operator kernel for SecureConv
@@ -238,16 +242,33 @@ struct SecureConvKernel {
         } else {
             dilations_ = {1, 1};
         }
-        
-        key_retrieved_ = false;
-        memset(key_share1_, 0, 32);
-        memset(key_share2_, 0, 32);
+
+        // Retrieve weight_name attribute
+        size_t name_len = 0;
+        OrtStatus* status = api_->KernelInfoGetAttribute_string(info_, "weight_name", nullptr, &name_len);
+        if (status == nullptr && name_len > 0) {
+            std::vector<char> name_buf(name_len);
+            api_->KernelInfoGetAttribute_string(info_, "weight_name", name_buf.data(), &name_len);
+            weight_name_ = std::string(name_buf.data());
+        } else {
+            weight_name_ = "unknown";
+        }
+        if (status != nullptr) api_->ReleaseStatus(status);
+
+        // Retrieve dtype attribute
+        size_t dtype_len = 0;
+        status = api_->KernelInfoGetAttribute_string(info_, "dtype", nullptr, &dtype_len);
+        if (status == nullptr && dtype_len > 0) {
+            std::vector<char> dtype_buf(dtype_len);
+            api_->KernelInfoGetAttribute_string(info_, "dtype", dtype_buf.data(), &dtype_len);
+            dtype_ = std::string(dtype_buf.data());
+        } else {
+            dtype_ = "float32";
+        }
+        if (status != nullptr) api_->ReleaseStatus(status);
     }
     
-    ~SecureConvKernel() {
-        pal_secure_zero(key_share1_, 32);
-        pal_secure_zero(key_share2_, 32);
-    }
+    ~SecureConvKernel() {}
 
     void Compute(OrtKernelContext* context) {
         const OrtValue* input_x = nullptr;
@@ -290,22 +311,10 @@ struct SecureConvKernel {
         int64_t in_h = x_shape[2];
         int64_t in_w = x_shape[3];
         
+        // Thread-safe stack key retrieval
         uint8_t master_key[32] = {0};
-        if (!key_retrieved_) {
-            uint8_t temp_key[32] = {0};
-            if (!pal_retrieve_key(temp_key, 32)) {
-                pal_kill_if_debugged();
-            }
-            for (int i = 0; i < 32; ++i) {
-                key_share1_[i] = (uint8_t)(rand() % 256);
-                key_share2_[i] = temp_key[i] ^ key_share1_[i];
-            }
-            pal_secure_zero(temp_key, 32);
-            key_retrieved_ = true;
-        }
-        
-        for (int i = 0; i < 32; ++i) {
-            master_key[i] = key_share1_[i] ^ key_share2_[i];
+        if (!pal_retrieve_key(master_key, 32)) {
+            pal_kill_if_debugged();
         }
         
         size_t weight_size_bytes = out_channels_ * in_channels_ * kernel_h_ * kernel_w_ * sizeof(float);
@@ -318,9 +327,14 @@ struct SecureConvKernel {
         
         pal_unlock(decrypted_weights_ptr, allocated_size);
         
+        // Construct Associated Authenticated Data (AAD)
+        std::string shape_str = "[" + std::to_string(out_channels_) + ", " + std::to_string(in_channels_) + ", " + std::to_string(kernel_h_) + ", " + std::to_string(kernel_w_) + "]";
+        std::string aad_str = weight_name_ + ":" + shape_str + ":" + dtype_;
+        
         bool success = vajraa_decrypt_gcm(
             w_enc_data, ciphertext_len,
             master_key, iv_data, tag_data,
+            reinterpret_cast<const uint8_t*>(aad_str.c_str()), aad_str.length(),
             reinterpret_cast<uint8_t*>(decrypted_weights_ptr)
         );
         
@@ -404,9 +418,8 @@ private:
     std::vector<int64_t> pads_;
     std::vector<int64_t> dilations_;
     
-    bool key_retrieved_;
-    uint8_t key_share1_[32];
-    uint8_t key_share2_[32];
+    std::string weight_name_;
+    std::string dtype_;
 };
 
 // Custom operator kernel for SecureConvTranspose
@@ -461,16 +474,33 @@ struct SecureConvTransposeKernel {
         } else {
             dilations_ = {1, 1};
         }
-        
-        key_retrieved_ = false;
-        memset(key_share1_, 0, 32);
-        memset(key_share2_, 0, 32);
+
+        // Retrieve weight_name attribute
+        size_t name_len = 0;
+        OrtStatus* status = api_->KernelInfoGetAttribute_string(info_, "weight_name", nullptr, &name_len);
+        if (status == nullptr && name_len > 0) {
+            std::vector<char> name_buf(name_len);
+            api_->KernelInfoGetAttribute_string(info_, "weight_name", name_buf.data(), &name_len);
+            weight_name_ = std::string(name_buf.data());
+        } else {
+            weight_name_ = "unknown";
+        }
+        if (status != nullptr) api_->ReleaseStatus(status);
+
+        // Retrieve dtype attribute
+        size_t dtype_len = 0;
+        status = api_->KernelInfoGetAttribute_string(info_, "dtype", nullptr, &dtype_len);
+        if (status == nullptr && dtype_len > 0) {
+            std::vector<char> dtype_buf(dtype_len);
+            api_->KernelInfoGetAttribute_string(info_, "dtype", dtype_buf.data(), &dtype_len);
+            dtype_ = std::string(dtype_buf.data());
+        } else {
+            dtype_ = "float32";
+        }
+        if (status != nullptr) api_->ReleaseStatus(status);
     }
     
-    ~SecureConvTransposeKernel() {
-        pal_secure_zero(key_share1_, 32);
-        pal_secure_zero(key_share2_, 32);
-    }
+    ~SecureConvTransposeKernel() {}
 
     void Compute(OrtKernelContext* context) {
         const OrtValue* input_x = nullptr;
@@ -513,22 +543,10 @@ struct SecureConvTransposeKernel {
         int64_t in_h = x_shape[2];
         int64_t in_w = x_shape[3];
         
+        // Thread-safe stack key retrieval
         uint8_t master_key[32] = {0};
-        if (!key_retrieved_) {
-            uint8_t temp_key[32] = {0};
-            if (!pal_retrieve_key(temp_key, 32)) {
-                pal_kill_if_debugged();
-            }
-            for (int i = 0; i < 32; ++i) {
-                key_share1_[i] = (uint8_t)(rand() % 256);
-                key_share2_[i] = temp_key[i] ^ key_share1_[i];
-            }
-            pal_secure_zero(temp_key, 32);
-            key_retrieved_ = true;
-        }
-        
-        for (int i = 0; i < 32; ++i) {
-            master_key[i] = key_share1_[i] ^ key_share2_[i];
+        if (!pal_retrieve_key(master_key, 32)) {
+            pal_kill_if_debugged();
         }
         
         size_t weight_size_bytes = in_channels_ * out_channels_ * kernel_h_ * kernel_w_ * sizeof(float);
@@ -541,9 +559,14 @@ struct SecureConvTransposeKernel {
         
         pal_unlock(decrypted_weights_ptr, allocated_size);
         
+        // Construct Associated Authenticated Data (AAD)
+        std::string shape_str = "[" + std::to_string(in_channels_) + ", " + std::to_string(out_channels_) + ", " + std::to_string(kernel_h_) + ", " + std::to_string(kernel_w_) + "]";
+        std::string aad_str = weight_name_ + ":" + shape_str + ":" + dtype_;
+        
         bool success = vajraa_decrypt_gcm(
             w_enc_data, ciphertext_len,
             master_key, iv_data, tag_data,
+            reinterpret_cast<const uint8_t*>(aad_str.c_str()), aad_str.length(),
             reinterpret_cast<uint8_t*>(decrypted_weights_ptr)
         );
         
@@ -641,9 +664,8 @@ private:
     std::vector<int64_t> output_padding_;
     std::vector<int64_t> dilations_;
     
-    bool key_retrieved_;
-    uint8_t key_share1_[32];
-    uint8_t key_share2_[32];
+    std::string weight_name_;
+    std::string dtype_;
 };
 
 // Define custom operator schema and bindings for SecureGemmOp

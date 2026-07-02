@@ -9,9 +9,10 @@ def derive_permutation_and_scales(seed_key: bytes, size: int) -> tuple:
     Derives a deterministic key-dependent permutation vector and scaling factors 
     using a SHA-256 hash of the seed key as a PRNG seed.
     """
-    # Create a deterministic PRNG seeded by the 64-bit hash of the key
-    hash_seed = int.from_bytes(hashlib.sha256(seed_key).digest()[:8], 'big')
-    rng = np.random.default_rng(hash_seed)
+    # Create a deterministic PRNG seeded by the full 256-bit hash of the key
+    digest = hashlib.sha256(seed_key).digest()
+    seeds = [int.from_bytes(digest[i:i+4], 'big') for i in range(0, 32, 4)]
+    rng = np.random.default_rng(seeds)
     
     # Generate permutation vector
     perm = rng.permutation(size)
@@ -58,9 +59,12 @@ def compile_model_weights(state_dict: dict, master_key: bytes) -> dict:
         else:
             weight_np = np.array(weight_tensor).copy()
 
+        # Derive unique AAD for each layer based on name, shape, and dtype
+        aad = f"{name}:{list(weight_np.shape)}:{str(weight_np.dtype)}".encode('utf-8')
+
         # Step 1: Encrypt the critical boundaries (First & Last layers) using AES
         if name.startswith(first_layer_name.split('.')[0]) or name.startswith(last_layer_name.split('.')[0]):
-            compiled_model["encrypted_layers"][name] = encrypt_tensor(weight_np, key_crypto)
+            compiled_model["encrypted_layers"][name] = encrypt_tensor(weight_np, key_crypto, aad=aad)
             compiled_model["metadata"]["layer_sizes_dict"][name] = int(weight_np.nbytes)
             continue
 
@@ -82,7 +86,7 @@ def compile_model_weights(state_dict: dict, master_key: bytes) -> dict:
             scrambled = scrambled * s_out[:, np.newaxis]
             scrambled = scrambled * s_in[np.newaxis, :]
             
-            compiled_model["obfuscated_layers"][name] = encrypt_tensor(scrambled, key_crypto)
+            compiled_model["obfuscated_layers"][name] = encrypt_tensor(scrambled, key_crypto, aad=aad)
             compiled_model["metadata"]["layer_sizes_dict"][name] = int(scrambled.nbytes)
             
             # Inject a Secret Mixer block parameters right after this layer
@@ -94,12 +98,14 @@ def compile_model_weights(state_dict: dict, master_key: bytes) -> dict:
             mixer_seed = int.from_bytes(hashlib.sha256(key_obfusc + mixer_key.encode()).digest()[:8], 'big')
             mixer_rng = np.random.default_rng(mixer_seed)
             w_mix = mixer_rng.normal(0, 0.01, size=(mix_size, mix_size)).astype(np.float32)
-            compiled_model["mixers"][mixer_key] = encrypt_tensor(w_mix, key_crypto)
+            
+            mixer_aad = f"{mixer_key}:{list(w_mix.shape)}:{str(w_mix.dtype)}".encode('utf-8')
+            compiled_model["mixers"][mixer_key] = encrypt_tensor(w_mix, key_crypto, aad=mixer_aad)
             compiled_model["metadata"]["layer_sizes_dict"][mixer_key] = int(w_mix.nbytes)
             
         else:
             # Fallback encrypt other parameters (like biases) for security
-            compiled_model["encrypted_layers"][name] = encrypt_tensor(weight_np, key_crypto)
+            compiled_model["encrypted_layers"][name] = encrypt_tensor(weight_np, key_crypto, aad=aad)
             compiled_model["metadata"]["layer_sizes_dict"][name] = int(weight_np.nbytes)
 
     # Calculate max parameter size

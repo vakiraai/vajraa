@@ -5,7 +5,7 @@ import numpy as np
 import hashlib
 import gc
 import ctypes
-from .crypto import decrypt_tensor
+from .crypto import decrypt_tensor, SecurityError
 from .compiler import derive_permutation_and_scales
 from .pal import (
     pal_alloc_secure,
@@ -15,7 +15,8 @@ from .pal import (
     pal_free_secure,
     pal_is_debugger_attached,
     pal_kill_if_debugged,
-    pal_get_available_memory
+    pal_get_available_memory,
+    pal_decrypt_gcm
 )
 
 class VajraaConfig:
@@ -197,7 +198,8 @@ class VajraaMemoryPool:
             for slot in self.slots:
                 slot.free()
             self.slots = []
-            self.is_initialized = False
+
+_active_leases = {}
 
 def secure_wrap_model(model: nn.Module, compiled_model: dict, master_key: bytes, config: VajraaConfig = None):
     """
@@ -261,56 +263,87 @@ def secure_wrap_model(model: nn.Module, compiled_model: dict, master_key: bytes,
                     delattr(module, 'weight')
                 module.register_parameter('weight', None)
                 
+                w_shape = tuple(module._enc_weight["shape"])
+                w_dtype = np.dtype(module._enc_weight["dtype"])
+                
+                b_shape = None
+                b_dtype = None
                 if bias_key in encrypted_layers:
                     module._enc_bias = encrypted_layers[bias_key]
                     if hasattr(module, 'bias'):
                         delattr(module, 'bias')
                     module.register_parameter('bias', None)
+                    b_shape = tuple(module._enc_bias["shape"])
+                    b_dtype = np.dtype(module._enc_bias["dtype"])
  
                 # Pre-hook for dynamic JIT decryption
-                def make_pre_hook_crypto():
+                def make_pre_hook_crypto(layer_name, w_key, b_key, w_sh, w_dt, b_sh, b_dt):
                     def pre_hook_crypto(mod, input_args):
                         if pal_is_debugger_attached():
                             pal_kill_if_debugged()
                         device = input_args[0].device
                         
+                        lease = {}
+                        
                         if hasattr(mod, '_enc_weight'):
-                            w_np = decrypt_tensor(mod._enc_weight, key_crypto)
-                            size_bytes = w_np.nbytes
+                            import base64
+                            ciphertext = base64.b64decode(mod._enc_weight["ciphertext"])
+                            iv = base64.b64decode(mod._enc_weight["iv"])
+                            tag = base64.b64decode(mod._enc_weight["tag"])
+                            size_bytes = len(ciphertext)
                             
-                            # Lease slot from pool if active, else standard dynamic allocation
+                            # Derive Associated Authenticated Data (AAD)
+                            aad = f"{w_key}:{list(w_sh)}:{str(w_dt)}".encode('utf-8')
+                            
                             slot = None
                             if pool and use_shuffling_pool:
                                 slot = pool.lease_slot(size_bytes)
                                 
                             if slot:
                                 ptr = slot.get_write_ptr()
-                                mod._weight_slot = slot
                             else:
                                 ptr = pal_alloc_secure(size_bytes)
                                 if ptr == 0:
                                     raise MemoryError("Vajraa: pal_alloc_secure failed for weight")
                                 pal_unlock(ptr, size_bytes)
-                                mod._weight_slot = None
                             
-                            # Load into page buffer and share with torch
+                            # Decrypt directly into C++ PAL memory using native decrypt (no Python heap plaintext)
+                            from .pal import pal_decrypt_gcm
+                            success = pal_decrypt_gcm(ciphertext, key_crypto, iv, tag, aad, ptr)
+                            if not success:
+                                if slot:
+                                    pool.release_slot(slot)
+                                else:
+                                    pal_secure_zero(ptr, size_bytes)
+                                    pal_free_secure(ptr, size_bytes)
+                                raise SecurityError("Vajraa: Decryption failed for weight")
+                                
                             if slot:
                                 read_ptr = slot.get_read_view()
                             else:
                                 read_ptr = ptr
                                 
                             ctypes_array = (ctypes.c_byte * size_bytes).from_address(read_ptr)
-                            ctypes.memmove(ctypes_array, w_np.ctypes.data, size_bytes)
-                            shared_np = np.frombuffer(ctypes_array, dtype=w_np.dtype)
+                            shared_np = np.frombuffer(ctypes_array, dtype=w_dt)
                             
-                            mod.weight_transient = torch.from_numpy(shared_np).reshape(w_np.shape).to(device)
+                            mod.weight_transient = torch.from_numpy(shared_np).reshape(w_sh).to(device)
                             mod.weight = nn.Parameter(mod.weight_transient, requires_grad=False)
-                            mod._weight_ptr = ptr
-                            mod._weight_size = size_bytes
+                            
+                            lease.update({
+                                'weight_slot': slot,
+                                'weight_ptr': ptr,
+                                'weight_size': size_bytes,
+                                'weight_transient': mod.weight_transient
+                            })
                             
                         if hasattr(mod, '_enc_bias'):
-                            b_np = decrypt_tensor(mod._enc_bias, key_crypto)
-                            size_bytes = b_np.nbytes
+                            import base64
+                            ciphertext = base64.b64decode(mod._enc_bias["ciphertext"])
+                            iv = base64.b64decode(mod._enc_bias["iv"])
+                            tag = base64.b64decode(mod._enc_bias["tag"])
+                            size_bytes = len(ciphertext)
+                            
+                            aad = f"{b_key}:{list(b_sh)}:{str(b_dt)}".encode('utf-8')
                             
                             slot = None
                             if pool and use_shuffling_pool:
@@ -318,111 +351,155 @@ def secure_wrap_model(model: nn.Module, compiled_model: dict, master_key: bytes,
                                 
                             if slot:
                                 ptr = slot.get_write_ptr()
-                                mod._bias_slot = slot
                             else:
                                 ptr = pal_alloc_secure(size_bytes)
                                 if ptr == 0:
                                     raise MemoryError("Vajraa: pal_alloc_secure failed for bias")
                                 pal_unlock(ptr, size_bytes)
-                                mod._bias_slot = None
                             
+                            from .pal import pal_decrypt_gcm
+                            success = pal_decrypt_gcm(ciphertext, key_crypto, iv, tag, aad, ptr)
+                            if not success:
+                                if slot:
+                                    pool.release_slot(slot)
+                                else:
+                                    pal_secure_zero(ptr, size_bytes)
+                                    pal_free_secure(ptr, size_bytes)
+                                raise SecurityError("Vajraa: Decryption failed for bias")
+                                
                             if slot:
                                 read_ptr = slot.get_read_view()
                             else:
                                 read_ptr = ptr
                                 
                             ctypes_array = (ctypes.c_byte * size_bytes).from_address(read_ptr)
-                            ctypes.memmove(ctypes_array, b_np.ctypes.data, size_bytes)
-                            shared_np = np.frombuffer(ctypes_array, dtype=b_np.dtype)
+                            shared_np = np.frombuffer(ctypes_array, dtype=b_dt)
                             
-                            mod.bias_transient = torch.from_numpy(shared_np).reshape(b_np.shape).to(device)
+                            mod.bias_transient = torch.from_numpy(shared_np).reshape(b_sh).to(device)
                             mod.bias = nn.Parameter(mod.bias_transient, requires_grad=False)
-                            mod._bias_ptr = ptr
-                            mod._bias_size = size_bytes
+                            
+                            lease.update({
+                                'bias_slot': slot,
+                                'bias_ptr': ptr,
+                                'bias_size': size_bytes,
+                                'bias_transient': mod.bias_transient
+                            })
+                            
+                        if lease:
+                            _active_leases[id(mod)] = lease
+                            
                     return pre_hook_crypto
  
                 def make_post_hook_crypto():
                     def post_hook_crypto(mod, input_args, output):
-                        # 1. Zero PyTorch transient buffers first
-                        if hasattr(mod, 'weight_transient'):
-                            mod.weight_transient.zero_()
-                        if hasattr(mod, 'bias_transient'):
-                            mod.bias_transient.zero_()
-                            
-                        # 2. Zero and free secure OS allocations (handling slots vs standard JIT)
-                        if hasattr(mod, '_weight_ptr'):
-                            slot = getattr(mod, '_weight_slot', None)
-                            if slot:
-                                pool.release_slot(slot)
-                                delattr(mod, '_weight_slot')
-                            else:
-                                pal_secure_zero(mod._weight_ptr, mod._weight_size)
-                                pal_free_secure(mod._weight_ptr, mod._weight_size)
-                            delattr(mod, '_weight_ptr')
-                            delattr(mod, '_weight_size')
-                            
-                        if hasattr(mod, '_bias_ptr'):
-                            slot = getattr(mod, '_bias_slot', None)
-                            if slot:
-                                pool.release_slot(slot)
-                                delattr(mod, '_bias_slot')
-                            else:
-                                pal_secure_zero(mod._bias_ptr, mod._bias_size)
-                                pal_free_secure(mod._bias_ptr, mod._bias_size)
-                            delattr(mod, '_bias_ptr')
-                            delattr(mod, '_bias_size')
-                            
-                        # 3. Clean up references
-                        if hasattr(mod, 'weight_transient'):
+                        # Clean up privately tracked leases
+                        lease = _active_leases.pop(id(mod), None)
+                        if lease:
+                            # 1. Zero PyTorch transient memory buffers
+                            w_trans = lease.get('weight_transient')
+                            if w_trans is not None:
+                                w_trans.zero_()
+                            b_trans = lease.get('bias_transient')
+                            if b_trans is not None:
+                                b_trans.zero_()
+                                
+                            # 2. Zero-wipe and free OS page-locked memory allocations
+                            w_ptr = lease.get('weight_ptr')
+                            w_size = lease.get('weight_size')
+                            w_slot = lease.get('weight_slot')
+                            if w_ptr:
+                                if w_slot:
+                                    pool.release_slot(w_slot)
+                                else:
+                                    pal_secure_zero(w_ptr, w_size)
+                                    pal_free_secure(w_ptr, w_size)
+                                    
+                            b_ptr = lease.get('bias_ptr')
+                            b_size = lease.get('bias_size')
+                            b_slot = lease.get('bias_slot')
+                            if b_ptr:
+                                if b_slot:
+                                    pool.release_slot(b_slot)
+                                else:
+                                    pal_secure_zero(b_ptr, b_size)
+                                    pal_free_secure(b_ptr, b_size)
+                                    
+                        # Guard cleanup of weights and biases to avoid deleting optional non-secured parameters
+                        if hasattr(mod, '_enc_weight'):
                             if hasattr(mod, 'weight'):
                                 delattr(mod, 'weight')
-                            del mod.weight_transient
-                        if hasattr(mod, 'bias_transient'):
+                        if hasattr(mod, '_enc_bias'):
                             if hasattr(mod, 'bias'):
                                 delattr(mod, 'bias')
-                            del mod.bias_transient
-                        gc.collect()
+                        if hasattr(mod, 'weight_transient'):
+                            delattr(mod, 'weight_transient')
+                        if hasattr(mod, 'bias_transient'):
+                            delattr(mod, 'bias_transient')
+                            
                     return post_hook_crypto
  
-                module.register_forward_pre_hook(make_pre_hook_crypto())
+                module.register_forward_pre_hook(make_pre_hook_crypto(name, weight_key, bias_key, w_shape, w_dtype, b_shape, b_dtype))
                 module.register_forward_hook(make_post_hook_crypto())
                 wrapped_modules.append((name, "crypto"))
  
             elif weight_key in obfuscated_layers:
-                obf_data = obfuscated_layers[weight_key]
-                w_scrambled = decrypt_tensor(obf_data, key_crypto)
-                
-                # Delete standard parameter and load the scrambled weights directly into RAM
+                module._enc_weight = obfuscated_layers[weight_key]
                 if hasattr(module, 'weight'):
                     delattr(module, 'weight')
-                module.weight_scrambled = nn.Parameter(torch.from_numpy(w_scrambled), requires_grad=False)
                 module.register_parameter('weight', None)
                 
-                # Check and intercept bias parameters for obfuscated layers
+                w_shape = tuple(module._enc_weight["shape"])
+                w_dtype = np.dtype(module._enc_weight["dtype"])
+                
+                b_shape = None
+                b_dtype = None
                 if bias_key in encrypted_layers:
                     module._enc_bias = encrypted_layers[bias_key]
                     if hasattr(module, 'bias'):
                         delattr(module, 'bias')
                     module.register_parameter('bias', None)
+                    b_shape = tuple(module._enc_bias["shape"])
+                    b_dtype = np.dtype(module._enc_bias["dtype"])
                 
-                # Store references to permutations and scaling factors
-                if len(w_scrambled.shape) != 2:
-                    raise ValueError(f"Vajraa: Obfuscation only supported for 2D weights, got shape {w_scrambled.shape}")
-                out_features, in_features = w_scrambled.shape
+                module._vajraa_weight_key = weight_key
+                module._vajraa_w_shape = w_shape
+                module._vajraa_w_dtype = w_dtype
+
+                # Expose weight_scrambled property dynamically to satisfy test queries securely (no persistent RAM weights)
+                def get_scrambled_weight(self_mod):
+                    if hasattr(self_mod, "_enc_weight") and hasattr(self_mod, "_vajraa_weight_key"):
+                        from .crypto import decrypt_tensor
+                        wk = self_mod._vajraa_weight_key
+                        ws = self_mod._vajraa_w_shape
+                        wd = self_mod._vajraa_w_dtype
+                        aad = f"{wk}:{list(ws)}:{str(wd)}".encode('utf-8')
+                        w_np = decrypt_tensor(self_mod._enc_weight, key_crypto, aad=aad)
+                        return torch.from_numpy(w_np)
+                    raise AttributeError("weight_scrambled")
+                type(module).weight_scrambled = property(get_scrambled_weight)
+                
+                out_features, in_features = w_shape
                 p_out, s_out = derive_permutation_and_scales(key_obfusc + weight_key.encode(), out_features)
                 p_in, s_in = derive_permutation_and_scales(key_obfusc + weight_key.encode() + b"_in", in_features)
                 
-                module._p_out = p_out
-                module._s_out = s_out
-                module._p_in = p_in
-                module._s_in = s_in
+                # Precompute inverse permutations and scales once at wrap-time
+                inv_p_out = np.argsort(p_out)
+                
+                module._p_in_cpu = torch.from_numpy(p_in)
+                module._inv_s_in_cpu = torch.from_numpy(1.0 / s_in)
+                module._inv_p_out_cpu = torch.from_numpy(inv_p_out)
+                module._inv_s_out_cpu = torch.from_numpy(1.0 / s_out)
                 
                 # Check if this layer has a non-linear mixer
                 mixer_key = f"mixer_{weight_key}"
+                m_shape = None
+                m_dtype = None
                 if mixer_key in mixers:
                     module._enc_mixer = mixers[mixer_key]
+                    m_shape = tuple(module._enc_mixer["shape"])
+                    m_dtype = np.dtype(module._enc_mixer["dtype"])
  
-                def make_pre_hook_obfusc():
+                def make_pre_hook_obfusc(layer_name, w_key, b_key, w_sh, w_dt, b_sh, b_dt):
                     def pre_hook_obfusc(mod, input_args):
                         if pal_is_debugger_attached():
                             pal_kill_if_debugged()
@@ -430,14 +507,22 @@ def secure_wrap_model(model: nn.Module, compiled_model: dict, master_key: bytes,
                         x = input_args[0]
                         device = x.device
                         
-                        p_in_t = torch.from_numpy(mod._p_in).to(device)
-                        inv_s_in_t = torch.from_numpy(1.0 / mod._s_in).to(device)
+                        p_in_t = mod._p_in_cpu.to(device)
+                        inv_s_in_t = mod._inv_s_in_cpu.to(device)
                         
                         x_transformed = x[..., p_in_t] * inv_s_in_t
                         
-                        if hasattr(mod, '_enc_bias'):
-                            b_np = decrypt_tensor(mod._enc_bias, key_crypto)
-                            size_bytes = b_np.nbytes
+                        lease = {}
+                        
+                        # Decrypt scrambled weights JIT
+                        if hasattr(mod, '_enc_weight'):
+                            import base64
+                            ciphertext = base64.b64decode(mod._enc_weight["ciphertext"])
+                            iv = base64.b64decode(mod._enc_weight["iv"])
+                            tag = base64.b64decode(mod._enc_weight["tag"])
+                            size_bytes = len(ciphertext)
+                            
+                            aad = f"{w_key}:{list(w_sh)}:{str(w_dt)}".encode('utf-8')
                             
                             slot = None
                             if pool and use_shuffling_pool:
@@ -445,62 +530,154 @@ def secure_wrap_model(model: nn.Module, compiled_model: dict, master_key: bytes,
                                 
                             if slot:
                                 ptr = slot.get_write_ptr()
-                                mod._bias_slot = slot
+                            else:
+                                ptr = pal_alloc_secure(size_bytes)
+                                if ptr == 0:
+                                    raise MemoryError("Vajraa: pal_alloc_secure failed for scrambled weight")
+                                pal_unlock(ptr, size_bytes)
+                                
+                            from .pal import pal_decrypt_gcm
+                            success = pal_decrypt_gcm(ciphertext, key_crypto, iv, tag, aad, ptr)
+                            if not success:
+                                if slot:
+                                    pool.release_slot(slot)
+                                else:
+                                    pal_secure_zero(ptr, size_bytes)
+                                    pal_free_secure(ptr, size_bytes)
+                                raise SecurityError("Vajraa: Decryption failed for scrambled weight")
+                                
+                            if slot:
+                                read_ptr = slot.get_read_view()
+                            else:
+                                read_ptr = ptr
+                                
+                            ctypes_array = (ctypes.c_byte * size_bytes).from_address(read_ptr)
+                            shared_np = np.frombuffer(ctypes_array, dtype=w_dt)
+                            
+                            mod.weight_transient = torch.from_numpy(shared_np).reshape(w_sh).to(device)
+                            mod.weight = nn.Parameter(mod.weight_transient, requires_grad=False)
+                            
+                            lease.update({
+                                'weight_slot': slot,
+                                'weight_ptr': ptr,
+                                'weight_size': size_bytes,
+                                'weight_transient': mod.weight_transient
+                            })
+                        
+                        # Decrypt bias JIT if present
+                        if hasattr(mod, '_enc_bias'):
+                            import base64
+                            ciphertext = base64.b64decode(mod._enc_bias["ciphertext"])
+                            iv = base64.b64decode(mod._enc_bias["iv"])
+                            tag = base64.b64decode(mod._enc_bias["tag"])
+                            size_bytes = len(ciphertext)
+                            
+                            aad = f"{b_key}:{list(b_sh)}:{str(b_dt)}".encode('utf-8')
+                            
+                            slot = None
+                            if pool and use_shuffling_pool:
+                                slot = pool.lease_slot(size_bytes)
+                                
+                            if slot:
+                                ptr = slot.get_write_ptr()
                             else:
                                 ptr = pal_alloc_secure(size_bytes)
                                 if ptr == 0:
                                     raise MemoryError("Vajraa: pal_alloc_secure failed for obfuscated bias")
                                 pal_unlock(ptr, size_bytes)
-                                mod._bias_slot = None
-                            
+                                
+                            from .pal import pal_decrypt_gcm
+                            success = pal_decrypt_gcm(ciphertext, key_crypto, iv, tag, aad, ptr)
+                            if not success:
+                                if slot:
+                                    pool.release_slot(slot)
+                                else:
+                                    pal_secure_zero(ptr, size_bytes)
+                                    pal_free_secure(ptr, size_bytes)
+                                raise SecurityError("Vajraa: Decryption failed for obfuscated bias")
+                                
                             if slot:
                                 read_ptr = slot.get_read_view()
                             else:
                                 read_ptr = ptr
                                 
                             ctypes_array = (ctypes.c_byte * size_bytes).from_address(read_ptr)
-                            ctypes.memmove(ctypes_array, b_np.ctypes.data, size_bytes)
-                            shared_np = np.frombuffer(ctypes_array, dtype=b_np.dtype)
+                            shared_np = np.frombuffer(ctypes_array, dtype=b_dt)
                             
-                            mod.bias_transient = torch.from_numpy(shared_np).reshape(b_np.shape).to(device)
-                            mod._bias_ptr = ptr
-                            mod._bias_size = size_bytes
-                        
-                        mod.weight = mod.weight_scrambled
+                            mod.bias_transient = torch.from_numpy(shared_np).reshape(b_sh).to(device)
+                            lease.update({
+                                'bias_slot': slot,
+                                'bias_ptr': ptr,
+                                'bias_size': size_bytes,
+                                'bias_transient': mod.bias_transient
+                            })
+                            
+                        if lease:
+                            _active_leases[id(mod)] = lease
+                            
                         return (x_transformed,)
                     return pre_hook_obfusc
  
-                def make_post_hook_obfusc():
+                def make_post_hook_obfusc(w_key, m_sh, m_dt):
                     def post_hook_obfusc(mod, input_args, output):
                         device = output.device
                         
-                        if hasattr(mod, 'weight'):
-                            delattr(mod, 'weight')
+                        # Retrieve and clean up active JIT leases
+                        lease = _active_leases.pop(id(mod), None)
                         
-                        inv_p_out = np.argsort(mod._p_out)
-                        inv_p_out_t = torch.from_numpy(inv_p_out).to(device)
-                        inv_s_out_t = torch.from_numpy(1.0 / mod._s_out).to(device)
+                        if hasattr(mod, '_enc_weight'):
+                            if hasattr(mod, 'weight'):
+                                delattr(mod, 'weight')
+                            
+                        if lease:
+                            w_trans = lease.get('weight_transient')
+                            if w_trans is not None:
+                                w_trans.zero_()
+                            w_ptr = lease.get('weight_ptr')
+                            w_size = lease.get('weight_size')
+                            w_slot = lease.get('weight_slot')
+                            if w_ptr:
+                                if w_slot:
+                                    pool.release_slot(w_slot)
+                                else:
+                                    pal_secure_zero(w_ptr, w_size)
+                                    pal_free_secure(w_ptr, w_size)
+ 
+                        inv_p_out_t = mod._inv_p_out_cpu.to(device)
+                        inv_s_out_t = mod._inv_s_out_cpu.to(device)
                         
                         output_unscrambled = output[..., inv_p_out_t] * inv_s_out_t[inv_p_out_t]
                         
+                        if lease:
+                            bias_transient = lease.get('bias_transient')
+                            if bias_transient is not None:
+                                output_unscrambled = output_unscrambled + bias_transient
+                                bias_transient.zero_()
+                            b_ptr = lease.get('bias_ptr')
+                            b_size = lease.get('bias_size')
+                            b_slot = lease.get('bias_slot')
+                            if b_ptr:
+                                if b_slot:
+                                    pool.release_slot(b_slot)
+                                else:
+                                    pal_secure_zero(b_ptr, b_size)
+                                    pal_free_secure(b_ptr, b_size)
+ 
+                        if hasattr(mod, 'weight_transient'):
+                            delattr(mod, 'weight_transient')
                         if hasattr(mod, 'bias_transient'):
-                            output_unscrambled = output_unscrambled + mod.bias_transient
-                            mod.bias_transient.zero_()
-                            
-                            slot = getattr(mod, '_bias_slot', None)
-                            if slot:
-                                pool.release_slot(slot)
-                                delattr(mod, '_bias_slot')
-                            else:
-                                pal_secure_zero(mod._bias_ptr, mod._bias_size)
-                                pal_free_secure(mod._bias_ptr, mod._bias_size)
                             delattr(mod, 'bias_transient')
-                            delattr(mod, '_bias_ptr')
-                            delattr(mod, '_bias_size')
-                        
+ 
+                        # Decrypt and apply secret mixer weight JIT
                         if hasattr(mod, '_enc_mixer'):
-                            w_mix = decrypt_tensor(mod._enc_mixer, key_crypto)
-                            size_bytes = w_mix.nbytes
+                            import base64
+                            ciphertext = base64.b64decode(mod._enc_mixer["ciphertext"])
+                            iv = base64.b64decode(mod._enc_mixer["iv"])
+                            tag = base64.b64decode(mod._enc_mixer["tag"])
+                            size_bytes = len(ciphertext)
+                            
+                            mixer_key = f"mixer_{w_key}"
+                            mixer_aad = f"{mixer_key}:{list(m_sh)}:{str(m_dt)}".encode('utf-8')
                             
                             slot = None
                             if pool and use_shuffling_pool:
@@ -508,45 +685,48 @@ def secure_wrap_model(model: nn.Module, compiled_model: dict, master_key: bytes,
                                 
                             if slot:
                                 ptr = slot.get_write_ptr()
-                                mod._mixer_slot = slot
                             else:
                                 ptr = pal_alloc_secure(size_bytes)
                                 if ptr == 0:
                                     raise MemoryError("Vajraa: pal_alloc_secure failed for mixer weight")
                                 pal_unlock(ptr, size_bytes)
-                                mod._mixer_slot = None
-                            
+                                
+                            from .pal import pal_decrypt_gcm
+                            success = pal_decrypt_gcm(ciphertext, key_crypto, iv, tag, mixer_aad, ptr)
+                            if not success:
+                                if slot:
+                                    pool.release_slot(slot)
+                                else:
+                                    pal_secure_zero(ptr, size_bytes)
+                                    pal_free_secure(ptr, size_bytes)
+                                raise SecurityError("Vajraa: Decryption failed for mixer weight")
+                                
                             if slot:
                                 read_ptr = slot.get_read_view()
                             else:
                                 read_ptr = ptr
                                 
                             ctypes_array = (ctypes.c_byte * size_bytes).from_address(read_ptr)
-                            ctypes.memmove(ctypes_array, w_mix.ctypes.data, size_bytes)
-                            shared_np = np.frombuffer(ctypes_array, dtype=w_mix.dtype)
-                            
-                            w_mix_t = torch.from_numpy(shared_np).reshape(w_mix.shape).to(device)
+                            shared_np = np.frombuffer(ctypes_array, dtype=m_dt)
+                            w_mix_t = torch.from_numpy(shared_np).reshape(m_sh).to(device)
                             
                             mixed_output = torch.nn.functional.gelu(output_unscrambled)
                             output_final = torch.matmul(mixed_output, w_mix_t)
                             
                             w_mix_t.zero_()
-                            
-                            slot = getattr(mod, '_mixer_slot', None)
                             if slot:
                                 pool.release_slot(slot)
-                                delattr(mod, '_mixer_slot')
                             else:
                                 pal_secure_zero(ptr, size_bytes)
                                 pal_free_secure(ptr, size_bytes)
-                            
+                                
                             return output_final
                         else:
                             return output_unscrambled
                     return post_hook_obfusc
  
-                module.register_forward_pre_hook(make_pre_hook_obfusc())
-                module.register_forward_hook(make_post_hook_obfusc())
+                module.register_forward_pre_hook(make_pre_hook_obfusc(name, weight_key, bias_key, w_shape, w_dtype, b_shape, b_dtype))
+                module.register_forward_hook(make_post_hook_obfusc(weight_key, m_shape, m_dtype))
                 wrapped_modules.append((name, "obfuscated"))
  
     return wrapped_modules
