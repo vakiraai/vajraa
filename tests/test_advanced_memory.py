@@ -140,5 +140,89 @@ class TestAdvancedMemoryControls(unittest.TestCase):
         outputs = session.run(["output"], {"input": x_np})
         self.assertEqual(outputs[0].shape, (1, 5))
 
+    def test_pytorch_dynamic_compaction(self):
+        """Verify PyTorch memory pool automatically compacts (releases slots) on idle timeout."""
+        import time
+        model = nn.Sequential(nn.Linear(10, 5, bias=False))
+        compiled = compile_model_weights(model.state_dict(), self.master_key)
+        
+        # Configure a short idle timeout of 0.2 seconds
+        config = VajraaConfig(use_shuffling=True, idle_timeout=0.2)
+        secure_wrap_model(model, compiled, self.master_key, config=config)
+        
+        pool = model._vajraa_pool
+        # Run inference to initialize and lease
+        x = torch.randn(1, 10)
+        _ = model(x)
+        
+        self.assertTrue(pool.is_initialized)
+        self.assertGreater(len(pool.slots), 0)
+        
+        # Wait for timeout to fire compaction
+        time.sleep(0.4)
+        
+        # Pool should now be compacted and de-initialized
+        self.assertFalse(pool.is_initialized)
+        self.assertEqual(len(pool.slots), 0)
+        
+        # Run inference again to verify lazy re-initialization works transparently
+        _ = model(x)
+        self.assertTrue(pool.is_initialized)
+        pool.shutdown()
+
+    def test_pytorch_double_mapping(self):
+        """Verify PyTorch double-mapping view isolation behaves correctly."""
+        model = nn.Sequential(nn.Linear(10, 5, bias=False))
+        compiled = compile_model_weights(model.state_dict(), self.master_key)
+        
+        # Enable double-mapping
+        config = VajraaConfig(use_shuffling=True, use_double_mapping=True)
+        secure_wrap_model(model, compiled, self.master_key, config=config)
+        
+        # Verify slot attributes
+        pool = model._vajraa_pool
+        pool.initialize()
+        for slot in pool.slots:
+            self.assertIsNotNone(slot.write_ptr)
+            self.assertIsNotNone(slot.read_ptr)
+            self.assertIsNone(slot.ptr)
+            
+        x = torch.randn(1, 10)
+        out = model(x)
+        self.assertEqual(out.shape, (1, 5))
+        pool.shutdown()
+
+    def test_onnx_dynamic_compaction(self):
+        """Verify ONNX Runtime C++ level memory pool compaction triggers via timer."""
+        import time
+        model = nn.Sequential(nn.Linear(10, 5, bias=False))
+        dummy_input = torch.randn(1, 10)
+        onnx_path = os.path.join(self.temp_dir.name, "model_comp.onnx")
+        torch.onnx.export(model, dummy_input, onnx_path, input_names=["input"], output_names=["output"])
+        
+        secured_onnx_path = os.path.join(self.temp_dir.name, "model_comp.ems")
+        rewrite_onnx_graph(onnx_path, secured_onnx_path, self.master_key)
+        
+        license_path = os.path.join(self.temp_dir.name, "license_comp.lic")
+        lic_bytes = generate_license("customer_123", self.master_key, self.customer_key, expiry_days=30)
+        with open(license_path, "wb") as f:
+            f.write(lic_bytes)
+            
+        # Set a short idle timeout of 0.2 seconds
+        config = VajraaConfig(use_shuffling=True, idle_timeout=0.2)
+        session = SecureONNXSession(secured_onnx_path, license_path, self.customer_key, config=config)
+        
+        # Run inference
+        x_np = np.random.randn(1, 10).astype(np.float32)
+        outputs = session.run(["output"], {"input": x_np})
+        self.assertEqual(outputs[0].shape, (1, 5))
+        
+        # Wait for dynamic cache compaction to fire in C++
+        time.sleep(0.4)
+        
+        # Run inference again to check lazy re-allocation is transparent
+        outputs2 = session.run(["output"], {"input": x_np})
+        self.assertEqual(outputs2[0].shape, (1, 5))
+
 if __name__ == "__main__":
     unittest.main()

@@ -26,29 +26,84 @@ class VajraaConfig:
         use_tiered_pools: bool = False,
         capped_pool_size_bytes: int = 100 * 1024 * 1024,  # default 100MB cap
         use_hybrid_mode: bool = False,
-        lazy_init: bool = False
+        lazy_init: bool = False,
+        idle_timeout: float = 5.0,
+        use_double_mapping: bool = True
     ):
         self.use_shuffling = use_shuffling
         self.use_tiered_pools = use_tiered_pools
         self.capped_pool_size_bytes = capped_pool_size_bytes
         self.use_hybrid_mode = use_hybrid_mode
         self.lazy_init = lazy_init
+        self.idle_timeout = idle_timeout
+        self.use_double_mapping = use_double_mapping
 
 class VajraaMemorySlot:
     """Represents a pre-allocated secure page block in the pool."""
-    def __init__(self, size: int):
+    def __init__(self, size: int, use_double_mapping: bool = True):
         self.size = size
-        self.ptr = pal_alloc_secure(size)
+        self.use_double_mapping = use_double_mapping
         self.in_use = False
         
+        if self.use_double_mapping:
+            self.write_ptr = pal_alloc_secure(size)
+            self.read_ptr = pal_alloc_secure(size)
+            self.ptr = None
+        else:
+            self.ptr = pal_alloc_secure(size)
+            self.write_ptr = None
+            self.read_ptr = None
+
+    def get_write_ptr(self) -> int:
+        if self.use_double_mapping:
+            pal_unlock(self.write_ptr, self.size)
+            return self.write_ptr
+        else:
+            pal_unlock(self.ptr, self.size)
+            return self.ptr
+
+    def get_read_view(self) -> int:
+        if self.use_double_mapping:
+            # Unlock read view to copy to it
+            pal_unlock(self.read_ptr, self.size)
+            ctypes.memmove(self.read_ptr, self.write_ptr, self.size)
+            # Lock write view back (W^R)
+            pal_lock(self.write_ptr, self.size)
+            return self.read_ptr
+        else:
+            return self.ptr
+
     def zero_wipe(self):
-        if self.ptr:
-            pal_secure_zero(self.ptr, self.size)
+        if self.use_double_mapping:
+            if self.write_ptr:
+                pal_unlock(self.write_ptr, self.size)
+                pal_secure_zero(self.write_ptr, self.size)
+                pal_lock(self.write_ptr, self.size)
+            if self.read_ptr:
+                pal_unlock(self.read_ptr, self.size)
+                pal_secure_zero(self.read_ptr, self.size)
+                pal_lock(self.read_ptr, self.size)
+        else:
+            if self.ptr:
+                pal_unlock(self.ptr, self.size)
+                pal_secure_zero(self.ptr, self.size)
+                pal_lock(self.ptr, self.size)
             
     def free(self):
-        if self.ptr:
-            pal_free_secure(self.ptr, self.size)
-            self.ptr = None
+        if self.use_double_mapping:
+            if self.write_ptr:
+                pal_free_secure(self.write_ptr, self.size)
+                self.write_ptr = None
+            if self.read_ptr:
+                pal_free_secure(self.read_ptr, self.size)
+                self.read_ptr = None
+        else:
+            if self.ptr:
+                pal_free_secure(self.ptr, self.size)
+                self.ptr = None
+
+import threading
+import time
 
 class VajraaMemoryPool:
     """Thread-safe page-locked memory pool supporting uniform or tiered slots."""
@@ -57,63 +112,92 @@ class VajraaMemoryPool:
         self.metadata = metadata
         self.slots = []
         self.is_initialized = False
+        self.lock = threading.Lock()
+        self.compaction_timer = None
+        self.last_inference_time = time.time()
         
     def initialize(self):
-        if self.is_initialized:
-            return
-            
-        max_size = self.metadata.get("max_layer_size_bytes", 0)
-        if max_size == 0:
+        with self.lock:
+            if self.is_initialized:
+                return
+                
+            max_size = self.metadata.get("max_layer_size_bytes", 0)
+            if max_size == 0:
+                self.is_initialized = True
+                return
+                
+            if self.config.use_tiered_pools:
+                self.tiers = [
+                    {"name": "small", "size": 4 * 1024 * 1024, "slots": 3},
+                    {"name": "medium", "size": 32 * 1024 * 1024, "slots": 2},
+                    {"name": "large", "size": max_size, "slots": 2}
+                ]
+                if max_size < 32 * 1024 * 1024:
+                    self.tiers[2]["size"] = 32 * 1024 * 1024
+                    
+                for tier in self.tiers:
+                    for _ in range(tier["slots"]):
+                        self.slots.append(VajraaMemorySlot(tier["size"], self.config.use_double_mapping))
+            else:
+                for _ in range(4):
+                    self.slots.append(VajraaMemorySlot(max_size, self.config.use_double_mapping))
+                    
             self.is_initialized = True
-            return
-            
-        if self.config.use_tiered_pools:
-            # Group into 3 tiers based on size to prevent fragmentation
-            self.tiers = [
-                {"name": "small", "size": 4 * 1024 * 1024, "slots": 3},      # 4MB slots
-                {"name": "medium", "size": 32 * 1024 * 1024, "slots": 2},    # 32MB slots
-                {"name": "large", "size": max_size, "slots": 2}             # max_size slots
-            ]
-            # Ensure large size is always at least the medium size
-            if max_size < 32 * 1024 * 1024:
-                self.tiers[2]["size"] = 32 * 1024 * 1024
-                
-            for tier in self.tiers:
-                for _ in range(tier["slots"]):
-                    self.slots.append(VajraaMemorySlot(tier["size"]))
-        else:
-            # Uniform pool: pre-allocate 4 slots of max_layer_size
-            for _ in range(4):
-                self.slots.append(VajraaMemorySlot(max_size))
-                
-        self.is_initialized = True
         
     def lease_slot(self, required_size: int) -> VajraaMemorySlot:
+        with self.lock:
+            self.last_inference_time = time.time()
+            if self.compaction_timer:
+                self.compaction_timer.cancel()
+                self.compaction_timer = None
+                
         if not self.is_initialized:
             self.initialize()
             
-        import random
-        # Find all free slots that are large enough
-        available = [s for s in self.slots if not s.in_use and s.size >= required_size]
-        if not available:
-            return None
-            
-        # Shuffling: pick a random slot from the available candidates
-        leased = random.choice(available) if self.config.use_shuffling else available[0]
-        leased.in_use = True
-        return leased
+        with self.lock:
+            import random
+            available = [s for s in self.slots if not s.in_use and s.size >= required_size]
+            if not available:
+                return None
+                
+            leased = random.choice(available) if self.config.use_shuffling else available[0]
+            leased.in_use = True
+            return leased
         
     def release_slot(self, slot: VajraaMemorySlot):
-        if slot:
-            slot.zero_wipe()
-            pal_lock(slot.ptr, slot.size)
-            slot.in_use = False
+        with self.lock:
+            if slot:
+                slot.zero_wipe()
+                slot.in_use = False
+            self.last_inference_time = time.time()
+            self.schedule_compaction()
             
+    def schedule_compaction(self):
+        if self.config.idle_timeout > 0:
+            if self.compaction_timer:
+                self.compaction_timer.cancel()
+            self.compaction_timer = threading.Timer(self.config.idle_timeout, self.compact)
+            self.compaction_timer.daemon = True
+            self.compaction_timer.start()
+            
+    def compact(self):
+        with self.lock:
+            if self.is_initialized and not any(s.in_use for s in self.slots):
+                for slot in self.slots:
+                    slot.free()
+                self.slots.clear()
+                self.is_initialized = False
+                print("[Vajraa] Dynamic Cache Compaction: Released idle memory pool slots.")
+                
     def shutdown(self):
-        for slot in self.slots:
-            slot.free()
-        self.slots = []
-        self.is_initialized = False
+        with self.lock:
+            if self.compaction_timer:
+                self.compaction_timer.cancel()
+                self.compaction_timer = None
+            for slot in self.slots:
+                slot.free()
+            self.slots = []
+            self.is_initialized = False
 
 def secure_wrap_model(model: nn.Module, compiled_model: dict, master_key: bytes, config: VajraaConfig = None):
     """
@@ -200,8 +284,7 @@ def secure_wrap_model(model: nn.Module, compiled_model: dict, master_key: bytes,
                                 slot = pool.lease_slot(size_bytes)
                                 
                             if slot:
-                                ptr = slot.ptr
-                                pal_unlock(ptr, slot.size)
+                                ptr = slot.get_write_ptr()
                                 mod._weight_slot = slot
                             else:
                                 ptr = pal_alloc_secure(size_bytes)
@@ -211,7 +294,12 @@ def secure_wrap_model(model: nn.Module, compiled_model: dict, master_key: bytes,
                                 mod._weight_slot = None
                             
                             # Load into page buffer and share with torch
-                            ctypes_array = (ctypes.c_byte * size_bytes).from_address(ptr)
+                            if slot:
+                                read_ptr = slot.get_read_view()
+                            else:
+                                read_ptr = ptr
+                                
+                            ctypes_array = (ctypes.c_byte * size_bytes).from_address(read_ptr)
                             ctypes.memmove(ctypes_array, w_np.ctypes.data, size_bytes)
                             shared_np = np.frombuffer(ctypes_array, dtype=w_np.dtype)
                             
@@ -229,8 +317,7 @@ def secure_wrap_model(model: nn.Module, compiled_model: dict, master_key: bytes,
                                 slot = pool.lease_slot(size_bytes)
                                 
                             if slot:
-                                ptr = slot.ptr
-                                pal_unlock(ptr, slot.size)
+                                ptr = slot.get_write_ptr()
                                 mod._bias_slot = slot
                             else:
                                 ptr = pal_alloc_secure(size_bytes)
@@ -239,7 +326,12 @@ def secure_wrap_model(model: nn.Module, compiled_model: dict, master_key: bytes,
                                 pal_unlock(ptr, size_bytes)
                                 mod._bias_slot = None
                             
-                            ctypes_array = (ctypes.c_byte * size_bytes).from_address(ptr)
+                            if slot:
+                                read_ptr = slot.get_read_view()
+                            else:
+                                read_ptr = ptr
+                                
+                            ctypes_array = (ctypes.c_byte * size_bytes).from_address(read_ptr)
                             ctypes.memmove(ctypes_array, b_np.ctypes.data, size_bytes)
                             shared_np = np.frombuffer(ctypes_array, dtype=b_np.dtype)
                             
@@ -352,8 +444,7 @@ def secure_wrap_model(model: nn.Module, compiled_model: dict, master_key: bytes,
                                 slot = pool.lease_slot(size_bytes)
                                 
                             if slot:
-                                ptr = slot.ptr
-                                pal_unlock(ptr, slot.size)
+                                ptr = slot.get_write_ptr()
                                 mod._bias_slot = slot
                             else:
                                 ptr = pal_alloc_secure(size_bytes)
@@ -362,7 +453,12 @@ def secure_wrap_model(model: nn.Module, compiled_model: dict, master_key: bytes,
                                 pal_unlock(ptr, size_bytes)
                                 mod._bias_slot = None
                             
-                            ctypes_array = (ctypes.c_byte * size_bytes).from_address(ptr)
+                            if slot:
+                                read_ptr = slot.get_read_view()
+                            else:
+                                read_ptr = ptr
+                                
+                            ctypes_array = (ctypes.c_byte * size_bytes).from_address(read_ptr)
                             ctypes.memmove(ctypes_array, b_np.ctypes.data, size_bytes)
                             shared_np = np.frombuffer(ctypes_array, dtype=b_np.dtype)
                             
@@ -411,8 +507,7 @@ def secure_wrap_model(model: nn.Module, compiled_model: dict, master_key: bytes,
                                 slot = pool.lease_slot(size_bytes)
                                 
                             if slot:
-                                ptr = slot.ptr
-                                pal_unlock(ptr, slot.size)
+                                ptr = slot.get_write_ptr()
                                 mod._mixer_slot = slot
                             else:
                                 ptr = pal_alloc_secure(size_bytes)
@@ -421,7 +516,12 @@ def secure_wrap_model(model: nn.Module, compiled_model: dict, master_key: bytes,
                                 pal_unlock(ptr, size_bytes)
                                 mod._mixer_slot = None
                             
-                            ctypes_array = (ctypes.c_byte * size_bytes).from_address(ptr)
+                            if slot:
+                                read_ptr = slot.get_read_view()
+                            else:
+                                read_ptr = ptr
+                                
+                            ctypes_array = (ctypes.c_byte * size_bytes).from_address(read_ptr)
                             ctypes.memmove(ctypes_array, w_mix.ctypes.data, size_bytes)
                             shared_np = np.frombuffer(ctypes_array, dtype=w_mix.dtype)
                             

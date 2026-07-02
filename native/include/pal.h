@@ -111,6 +111,16 @@ void* pal_lease_secure_slot(size_t required_size, size_t* allocated_size);
  */
 void pal_release_secure_slot(void* ptr, size_t allocated_size);
 
+/**
+ * Transitions a write view to read-only execution view and returns the read view pointer.
+ */
+void* pal_get_read_view(void* write_ptr, size_t allocated_size);
+
+/**
+ * Releases all idle memory pool allocations to the operating system.
+ */
+bool pal_compact_pool();
+
 #ifdef __cplusplus
 }
 #endif

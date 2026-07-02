@@ -121,7 +121,8 @@ struct SecureGemmKernel {
             return;
         }
         
-        const float* w_data = reinterpret_cast<const float*>(decrypted_weights_ptr);
+        void* read_weights_ptr = pal_get_read_view(decrypted_weights_ptr, allocated_size);
+        const float* w_data = reinterpret_cast<const float*>(read_weights_ptr);
         
         // 5. Check if bias is supplied as 5th input
         float* bias_data = nullptr;
@@ -330,7 +331,8 @@ struct SecureConvKernel {
             return;
         }
         
-        const float* w_data = reinterpret_cast<const float*>(decrypted_weights_ptr);
+        void* read_weights_ptr = pal_get_read_view(decrypted_weights_ptr, allocated_size);
+        const float* w_data = reinterpret_cast<const float*>(read_weights_ptr);
         
         int64_t out_h = (in_h + pads_[0] + pads_[2] - dilations_[0] * (kernel_h_ - 1) - 1) / strides_[0] + 1;
         int64_t out_w = (in_w + pads_[1] + pads_[3] - dilations_[1] * (kernel_w_ - 1) - 1) / strides_[1] + 1;
@@ -552,7 +554,8 @@ struct SecureConvTransposeKernel {
             return;
         }
         
-        const float* w_data = reinterpret_cast<const float*>(decrypted_weights_ptr);
+        void* read_weights_ptr = pal_get_read_view(decrypted_weights_ptr, allocated_size);
+        const float* w_data = reinterpret_cast<const float*>(read_weights_ptr);
         
         int64_t out_h = strides_[0] * (in_h - 1) + output_padding_[0] + dilations_[0] * (kernel_h_ - 1) + 1 - pads_[0] - pads_[2];
         int64_t out_w = strides_[1] * (in_w - 1) + output_padding_[1] + dilations_[1] * (kernel_w_ - 1) + 1 - pads_[1] - pads_[3];

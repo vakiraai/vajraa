@@ -23,6 +23,12 @@ for path in possible_dll_paths:
             _vajraa_dll = ctypes.CDLL(path)
             _vajraa_dll.pal_secure_zero.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
             _vajraa_dll.pal_secure_zero.restype = None
+            
+            _vajraa_dll.pal_get_read_view.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            _vajraa_dll.pal_get_read_view.restype = ctypes.c_void_p
+            
+            _vajraa_dll.pal_compact_pool.argtypes = []
+            _vajraa_dll.pal_compact_pool.restype = ctypes.c_bool
             break
         except Exception:
             pass
@@ -159,6 +165,30 @@ def pal_free_secure(ptr: int, size: int):
             kernel32.VirtualFree(ptr, 0, MEM_RELEASE)
         elif IS_LINUX or IS_MACOS:
             libc.munmap(ptr, size)
+
+def pal_compact_pool() -> bool:
+    """
+    Releases all idle memory pool allocations to the operating system.
+    """
+    if _vajraa_dll is not None:
+        try:
+            return bool(_vajraa_dll.pal_compact_pool())
+        except Exception:
+            pass
+    return False
+
+def pal_get_read_view(write_ptr: int, allocated_size: int) -> int:
+    """
+    Transitions a write view to read-only execution view and returns the read view pointer.
+    """
+    if write_ptr != 0:
+        if _vajraa_dll is not None:
+            try:
+                ptr = _vajraa_dll.pal_get_read_view(ctypes.c_void_p(write_ptr), ctypes.c_size_t(allocated_size))
+                return ptr if ptr else write_ptr
+            except Exception:
+                pass
+    return write_ptr
 
 # ==========================================
 # 2. Anti-Debugging

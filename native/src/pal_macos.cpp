@@ -13,9 +13,11 @@
 #include <algorithm>
 
 struct CppMemorySlot {
-    void* ptr;
+    void* write_ptr;
+    void* read_ptr;
     size_t size;
     bool in_use;
+    int fd;
 };
 
 #ifndef PT_DENY_ATTACH
@@ -160,24 +162,43 @@ bool pal_configure_pool(bool use_shuffling, bool use_tiered, size_t capped_size,
 
     // Clean up old pool if exists
     for (auto& slot : g_pool) {
-        pal_free_secure(slot.ptr, slot.size);
+        if (slot.write_ptr) munmap(slot.write_ptr, slot.size);
+        if (slot.read_ptr) munmap(slot.read_ptr, slot.size);
+        if (slot.fd >= 0) close(slot.fd);
     }
     g_pool.clear();
     g_pool_initialized = false;
 
     if (use_pool && g_max_layer_size > 0) {
+        auto create_slot = [](size_t sz, std::vector<CppMemorySlot>& pool) {
+            CppMemorySlot slot = { nullptr, nullptr, sz, false, -1 };
+            char shm_name[64];
+            snprintf(shm_name, sizeof(shm_name), "/vajra_shm_%d_%ld", getpid(), random());
+            slot.fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+            if (slot.fd >= 0) {
+                shm_unlink(shm_name); // Unlink immediately so no other process can access it
+                if (ftruncate(slot.fd, sz) >= 0) {
+                    slot.write_ptr = mmap(NULL, sz, PROT_NONE, MAP_SHARED, slot.fd, 0);
+                    slot.read_ptr = mmap(NULL, sz, PROT_NONE, MAP_SHARED, slot.fd, 0);
+                    if (slot.write_ptr != MAP_FAILED && slot.read_ptr != MAP_FAILED) {
+                        pool.push_back(slot);
+                        return;
+                    }
+                    if (slot.write_ptr != MAP_FAILED) munmap(slot.write_ptr, sz);
+                    if (slot.read_ptr != MAP_FAILED) munmap(slot.read_ptr, sz);
+                }
+                close(slot.fd);
+            }
+        };
+
         if (g_use_tiered) {
             // Tier 1 (Small): 4MB slots (3 slots)
             for (int i = 0; i < 3; ++i) {
-                size_t size = 4 * 1024 * 1024;
-                void* ptr = pal_alloc_secure(size);
-                if (ptr) g_pool.push_back({ptr, size, false});
+                create_slot(4 * 1024 * 1024, g_pool);
             }
             // Tier 2 (Medium): 32MB slots (2 slots)
             for (int i = 0; i < 2; ++i) {
-                size_t size = 32 * 1024 * 1024;
-                void* ptr = pal_alloc_secure(size);
-                if (ptr) g_pool.push_back({ptr, size, false});
+                create_slot(32 * 1024 * 1024, g_pool);
             }
             // Tier 3 (Large): max_layer_size slots (2 slots)
             size_t large_size = g_max_layer_size;
@@ -185,14 +206,12 @@ bool pal_configure_pool(bool use_shuffling, bool use_tiered, size_t capped_size,
                 large_size = 32 * 1024 * 1024;
             }
             for (int i = 0; i < 2; ++i) {
-                void* ptr = pal_alloc_secure(large_size);
-                if (ptr) g_pool.push_back({ptr, large_size, false});
+                create_slot(large_size, g_pool);
             }
         } else {
             // Uniform pool: 4 slots of max_layer_size
             for (int i = 0; i < 4; ++i) {
-                void* ptr = pal_alloc_secure(g_max_layer_size);
-                if (ptr) g_pool.push_back({ptr, g_max_layer_size, false});
+                create_slot(g_max_layer_size, g_pool);
             }
         }
         g_pool_initialized = true;
@@ -213,7 +232,6 @@ void* pal_lease_secure_slot(size_t required_size, size_t* allocated_size) {
         if (!available.empty()) {
             CppMemorySlot* leased = nullptr;
             if (g_use_shuffling) {
-                // Pick a random slot
                 std::random_device rd;
                 std::mt19937 gen(rd());
                 std::uniform_int_distribution<> dis(0, static_cast<int>(available.size()) - 1);
@@ -226,16 +244,17 @@ void* pal_lease_secure_slot(size_t required_size, size_t* allocated_size) {
             if (allocated_size) {
                 *allocated_size = leased->size;
             }
-            // Unlock the leased slot for use
-            pal_unlock(leased->ptr, leased->size);
-            return leased->ptr;
+            
+            // Unlock write view to writable for decryption
+            mprotect(leased->write_ptr, leased->size, PROT_READ | PROT_WRITE);
+            return leased->write_ptr;
         }
     }
 
-    // Fallback: Allocate dynamically
+    // Fallback: Allocate dynamically (standard JIT allocation)
     void* ptr = pal_alloc_secure(required_size);
     if (ptr) {
-        pal_unlock(ptr, required_size);
+        mprotect(ptr, required_size, PROT_READ | PROT_WRITE);
         if (allocated_size) {
             *allocated_size = required_size;
         }
@@ -243,14 +262,38 @@ void* pal_lease_secure_slot(size_t required_size, size_t* allocated_size) {
     return ptr;
 }
 
+void* pal_get_read_view(void* write_ptr, size_t allocated_size) {
+    if (write_ptr == nullptr) return nullptr;
+
+    if (g_pool_initialized) {
+        for (auto& slot : g_pool) {
+            if (slot.write_ptr == write_ptr) {
+                // Transition write view to PROT_NONE
+                mprotect(slot.write_ptr, slot.size, PROT_NONE);
+                // Transition read view to PROT_READ
+                mprotect(slot.read_ptr, slot.size, PROT_READ);
+                return slot.read_ptr;
+            }
+        }
+    }
+
+    // Fallback: Dynamic allocation is not double-mapped, return write_ptr itself
+    return write_ptr;
+}
+
 void pal_release_secure_slot(void* ptr, size_t allocated_size) {
     if (ptr == nullptr) return;
 
     if (g_pool_initialized) {
         for (auto& slot : g_pool) {
-            if (slot.ptr == ptr) {
-                pal_secure_zero(slot.ptr, slot.size);
-                pal_lock(slot.ptr, slot.size);
+            if (slot.write_ptr == ptr || slot.read_ptr == ptr) {
+                // Lock read view
+                mprotect(slot.read_ptr, slot.size, PROT_NONE);
+                // Unlock write view to PROT_READ | PROT_WRITE to zero-wipe
+                mprotect(slot.write_ptr, slot.size, PROT_READ | PROT_WRITE);
+                pal_secure_zero(slot.write_ptr, slot.size);
+                // Lock write view back
+                mprotect(slot.write_ptr, slot.size, PROT_NONE);
                 slot.in_use = false;
                 return;
             }
@@ -258,8 +301,27 @@ void pal_release_secure_slot(void* ptr, size_t allocated_size) {
     }
 
     // Fallback: Standard JIT free
+    mprotect(ptr, allocated_size, PROT_READ | PROT_WRITE);
     pal_secure_zero(ptr, allocated_size);
     pal_free_secure(ptr, allocated_size);
+}
+
+bool pal_compact_pool() {
+    std::vector<CppMemorySlot> active_slots;
+    for (auto& slot : g_pool) {
+        if (slot.in_use) {
+            active_slots.push_back(slot);
+        } else {
+            if (slot.write_ptr) munmap(slot.write_ptr, slot.size);
+            if (slot.read_ptr) munmap(slot.read_ptr, slot.size);
+            if (slot.fd >= 0) close(slot.fd);
+        }
+    }
+    g_pool = active_slots;
+    if (g_pool.empty()) {
+        g_pool_initialized = false;
+    }
+    return true;
 }
 
 } // extern "C"
