@@ -12,6 +12,7 @@ extern "C" {
 
 bool vajraa_decrypt_gcm(const uint8_t* ciphertext, size_t ciphertext_len,
                        const uint8_t* key, const uint8_t* iv, const uint8_t* tag,
+                       const uint8_t* aad, size_t aad_len,
                        uint8_t* plaintext_out) {
     BCRYPT_ALG_HANDLE hAlg = NULL;
     BCRYPT_KEY_HANDLE hKey = NULL;
@@ -60,6 +61,12 @@ bool vajraa_decrypt_gcm(const uint8_t* ciphertext, size_t ciphertext_len,
     authInfo.cbNonce = 12;
     authInfo.pbTag = (PUCHAR)tag;
     authInfo.cbTag = 16;
+    
+    // Add AAD if provided
+    if (aad && aad_len > 0) {
+        authInfo.pbAuthData = (PUCHAR)aad;
+        authInfo.cbAuthData = (ULONG)aad_len;
+    }
 
     // 5. Decrypt
     DWORD cbPlaintext = 0;
@@ -82,6 +89,7 @@ extern "C" {
 
 bool vajraa_decrypt_gcm(const uint8_t* ciphertext, size_t ciphertext_len,
                        const uint8_t* key, const uint8_t* iv, const uint8_t* tag,
+                       const uint8_t* aad, size_t aad_len,
                        uint8_t* plaintext_out) {
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) return false;
@@ -107,20 +115,29 @@ bool vajraa_decrypt_gcm(const uint8_t* ciphertext, size_t ciphertext_len,
         return false;
     }
 
-    // 4. Perform decryption update
+    // 4. Provide AAD if available
+    if (aad && aad_len > 0) {
+        int out_len = 0;
+        if (EVP_DecryptUpdate(ctx, NULL, &out_len, aad, aad_len) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+    }
+
+    // 5. Perform decryption update
     if (EVP_DecryptUpdate(ctx, plaintext_out, &len, ciphertext, ciphertext_len) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         return false;
     }
     plaintext_len = len;
 
-    // 5. Provide the tag to EVP for authentication verification
+    // 6. Provide the tag to EVP for authentication verification
     if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, const_cast<uint8_t*>(tag)) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         return false;
     }
 
-    // 6. Finalize decryption. Checks the cryptographic authentication tag integrity.
+    // 7. Finalize decryption. Checks the cryptographic authentication tag integrity.
     int ret = EVP_DecryptFinal_ex(ctx, plaintext_out + len, &len);
     EVP_CIPHER_CTX_free(ctx);
 

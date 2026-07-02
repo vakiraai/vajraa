@@ -5,9 +5,9 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 import json
 
-def encrypt_tensor(tensor_np: np.ndarray, key: bytes) -> dict:
+def encrypt_tensor(tensor_np: np.ndarray, key: bytes, aad: bytes = None) -> dict:
     """
-    Encrypts a numpy array using AES-256-GCM.
+    Encrypts a numpy array using AES-256-GCM with optional AAD.
     Returns a dict containing the ciphertext, IV, tag, shape, and dtype.
     """
     import base64
@@ -24,6 +24,9 @@ def encrypt_tensor(tensor_np: np.ndarray, key: bytes) -> dict:
         backend=default_backend()
     ).encryptor()
     
+    if aad:
+        encryptor.authenticate_additional_data(aad)
+        
     # Encrypt
     ciphertext = encryptor.update(raw_data) + encryptor.finalize()
     
@@ -39,7 +42,7 @@ class SecurityError(Exception):
     """Custom exception raised for security-related validation and decryption failures."""
     pass
 
-def decrypt_tensor(enc_dict: dict, key: bytes) -> np.ndarray:
+def decrypt_tensor(enc_dict: dict, key: bytes, aad: bytes = None) -> np.ndarray:
     """
     Decrypts an encrypted tensor dict and reconstructs the numpy array.
     Raises SecurityError on validation or decryption failure.
@@ -59,6 +62,9 @@ def decrypt_tensor(enc_dict: dict, key: bytes) -> np.ndarray:
             backend=default_backend()
         ).decryptor()
         
+        if aad:
+            decryptor.authenticate_additional_data(aad)
+            
         # Decrypt
         raw_data = decryptor.update(ciphertext) + decryptor.finalize()
         

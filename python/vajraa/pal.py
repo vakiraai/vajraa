@@ -29,6 +29,18 @@ for path in possible_dll_paths:
             
             _vajraa_dll.pal_compact_pool.argtypes = []
             _vajraa_dll.pal_compact_pool.restype = ctypes.c_bool
+
+            _vajraa_dll.vajraa_decrypt_gcm.argtypes = [
+                ctypes.c_void_p, # ciphertext
+                ctypes.c_size_t, # ciphertext_len
+                ctypes.c_void_p, # key
+                ctypes.c_void_p, # iv
+                ctypes.c_void_p, # tag
+                ctypes.c_void_p, # aad
+                ctypes.c_size_t, # aad_len
+                ctypes.c_void_p  # plaintext_out
+            ]
+            _vajraa_dll.vajraa_decrypt_gcm.restype = ctypes.c_bool
             break
         except Exception:
             pass
@@ -189,6 +201,28 @@ def pal_get_read_view(write_ptr: int, allocated_size: int) -> int:
             except Exception:
                 pass
     return write_ptr
+
+def pal_decrypt_gcm(ciphertext: bytes, key: bytes, iv: bytes, tag: bytes, aad: bytes, dest_ptr: int) -> bool:
+    """
+    Decrypts ciphertext using GCM directly into the provided destination address pointer (dest_ptr).
+    Guarantees no plaintext exposure in Python heap.
+    """
+    if _vajraa_dll is None:
+        return False
+    try:
+        return bool(_vajraa_dll.vajraa_decrypt_gcm(
+            ciphertext,
+            ctypes.c_size_t(len(ciphertext)),
+            key,
+            iv,
+            tag,
+            aad,
+            ctypes.c_size_t(len(aad)) if aad else ctypes.c_size_t(0),
+            ctypes.c_void_p(dest_ptr)
+        ))
+    except Exception as e:
+        print(f"[Vajraa] PAL decrypt GCM error: {e}")
+        return False
 
 # ==========================================
 # 2. Anti-Debugging
