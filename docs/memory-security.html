@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="Vajraa — AI Model Security Library documentation">
+<title>Memory Security — Vajraa Docs</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<!-- TOP HEADER -->
+<header class="top-header">
+  <a href="index.html" class="logo-link">
+    <div class="logo-icon">V</div>
+    <span class="logo-text">Vajraa</span>
+    <span class="logo-badge">v1.0</span>
+  </a>
+  <div class="header-search">
+    <span class="search-icon">🔍</span>
+    <input type="text" id="search-input" placeholder="Search docs…">
+  </div>
+  <nav class="header-nav">
+    <a href="https://github.com/vakiraai/vajraa" target="_blank">GitHub</a>
+  </nav>
+</header>
+
+<div class="layout">
+  <nav class="sidebar">
+<span class="sidebar-label">Documentation</span>
+<a href="index.html" class="sidebar-link"><span class="icon">🏠</span>Home</a>
+<a href="getting-started.html" class="sidebar-link"><span class="icon">🚀</span>Getting Started</a>
+<a href="architecture.html" class="sidebar-link"><span class="icon">🏛️</span>Architecture</a>
+<a href="flows.html" class="sidebar-link"><span class="icon">🔄</span>Flows</a>
+<a href="python-api.html" class="sidebar-link"><span class="icon">🐍</span>Python API</a>
+<a href="cpp-api.html" class="sidebar-link"><span class="icon">⚙️</span>C++ API</a>
+<a href="memory-security.html" class="sidebar-link active"><span class="icon">🛡️</span>Memory Security</a>
+</nav>
+  <main class="main">
+    <div class="breadcrumb"><a href="index.html">Home</a><span class="sep">/</span><span class="current">Memory Security</span></div>
+    
+<h1 class="page-title">Memory <span class="accent">Security</span> Deep Dive</h1>
+<p class="page-subtitle">How Vajraa uses OS virtual memory features to make encrypted model weights invisible to memory scanners, debuggers, and dump tools.</p>
+
+<div class="section">
+<h2 id="the-problem">The Core Problem: RAM is Readable</h2>
+<p>Every software DRM system has the same fatal weakness: to run a model, the weights <em>must</em> be loaded into RAM. And RAM can be read by:</p>
+<ul>
+  <li><strong>Debuggers</strong> (x64dbg, IDA Pro, lldb, gdb) — can dump memory at any address</li>
+  <li><strong>Memory scanners</strong> (Cheat Engine, process monitors) — scan for floating-point patterns</li>
+  <li><strong>OS-level tools</strong> (<code>/proc/pid/mem</code> on Linux, <code>ReadProcessMemory</code> on Windows)</li>
+  <li><strong>Cold boot attacks</strong> — physically reading DRAM chips after power-off</li>
+</ul>
+<p>Traditional DRM solutions encrypt weights on disk, but decrypt them entirely into a normal heap allocation before use. Once there, a memory dump captures everything.</p>
+<p>Vajraa's solution: <strong>make the decrypted weights exist only inside OS pages that are locked to NOACCESS, and expose them only through a separate read-only view for the exact duration of the computation.</strong></p>
+</div>
+
+<div class="section">
+<h2 id="page-protection">Virtual Memory Page Protection</h2>
+<p>Modern CPUs have a Memory Management Unit (MMU) that enforces access permissions on a per-page basis (typically 4KB pages). The OS sets these permissions in page table entries.</p>
+<table class="params-table">
+  <thead><tr><th>Protection Flag</th><th>Windows</th><th>Linux/macOS</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>No Access</td><td>PAGE_NOACCESS</td><td>PROT_NONE</td><td>Any access (read or write) triggers SIGSEGV / Access Violation</td></tr>
+    <tr><td>Read Only</td><td>PAGE_READONLY</td><td>PROT_READ</td><td>Reads OK, writes cause fault</td></tr>
+    <tr><td>Read+Write</td><td>PAGE_READWRITE</td><td>PROT_READ|PROT_WRITE</td><td>Normal accessible memory</td></tr>
+  </tbody>
+</table>
+<p>All Vajraa pool slots are allocated with <strong>NOACCESS</strong> by default. This means the pages exist but any attempt to touch them immediately crashes the process — including memory scanner tools that try to enumerate all readable memory regions.</p>
+</div>
+
+<div class="section">
+<h2 id="double-mapping">W^R Double-Mapped Virtual Views</h2>
+<p>The crown jewel of Vajraa's memory protection. Two different virtual addresses point to the <strong>same physical memory page</strong>, but each has different permissions at different times — and they are <em>never simultaneously accessible</em>.</p>
+
+<pre><code>
+              PHYSICAL MEMORY (OS kernel manages)
+              ┌───────────────────────────────────┐
+              │  Page frame(s) — 4KB+ of data     │
+              └───────────────────────────────────┘
+                     ▲                    ▲
+                     │                    │
+              [write_ptr]           [read_ptr]
+              0x7F1234000           0x7F5678000
+          Different virtual           Different virtual
+           address, same               address, same
+          physical pages              physical pages
+
+How it's created:
+  Windows:  CreateFileMapping(INVALID_HANDLE_VALUE, ...)
+            write_ptr = MapViewOfFile(hmap, FILE_MAP_WRITE, ...)
+            read_ptr  = MapViewOfFile(hmap, FILE_MAP_READ, ...)
+
+  Linux:    shm_fd = shm_open("/vajra_shm_PID_N", O_RDWR|O_CREAT|O_EXCL, ...)
+            shm_unlink(name)  ← immediately unlink so no process can open it
+            ftruncate(shm_fd, size)
+            write_ptr = mmap(NULL, size, PROT_NONE, MAP_SHARED, shm_fd, 0)
+            read_ptr  = mmap(NULL, size, PROT_NONE, MAP_SHARED, shm_fd, 0)
+
+  macOS:    Same as Linux — shm_open + double mmap
+</code></pre>
+
+<h3 id="state-machine">The Permission State Machine</h3>
+<pre><code>
+                ┌─────────────────────────────────────────────────────┐
+                │  IDLE STATE (between inference calls)               │
+                │  write_ptr: NOACCESS   read_ptr: NOACCESS           │
+                │  Any access = instant crash                          │
+                └─────────────────┬───────────────────────────────────┘
+                                  │ pal_lease_secure_slot()
+                                  ▼
+                ┌─────────────────────────────────────────────────────┐
+                │  DECRYPT STATE                                       │
+                │  write_ptr: READWRITE  read_ptr: NOACCESS           │
+                │  Decrypted bytes written into write_ptr buffer       │
+                │  read_ptr still inaccessible — cannot be read yet   │
+                └─────────────────┬───────────────────────────────────┘
+                                  │ pal_get_read_view()
+                                  ▼
+                ┌─────────────────────────────────────────────────────┐
+                │  EXECUTE STATE                                       │
+                │  write_ptr: NOACCESS   read_ptr: READONLY           │
+                │  write_ptr is now inaccessible (write protection)   │
+                │  read_ptr is read-only — torch reads weights here   │
+                │  Any attempt to write to write_ptr = crash          │
+                └─────────────────┬───────────────────────────────────┘
+                                  │ pal_release_secure_slot()
+                                  ▼
+                ┌─────────────────────────────────────────────────────┐
+                │  WIPE STATE                                          │
+                │  write_ptr briefly unlocked to READWRITE            │
+                │  pal_secure_zero(write_ptr) — guaranteed zero       │
+                │  write_ptr: NOACCESS   read_ptr: NOACCESS           │
+                └─────────────────────────────────────────────────────┘
+                              Back to IDLE STATE
+</code></pre>
+
+<h3 id="why-effective">Why This Defeats Memory Dumping</h3>
+<ul>
+  <li><strong>Memory scanners</strong> enumerate pages with <code>VirtualQuery</code> / <code>/proc/maps</code> looking for <code>READWRITE</code> regions. Vajraa's pages appear as <code>NOACCESS</code> at rest — invisible to scanners.</li>
+  <li><strong>Hardware breakpoints on reads</strong> (DR0-DR3 on x86) only fire when the monitored address is accessed. With two separate virtual addresses, a breakpoint on <code>write_ptr</code> won't fire during execution (execution uses <code>read_ptr</code>), and a breakpoint on <code>read_ptr</code> won't fire during decryption (decryption uses <code>write_ptr</code>).</li>
+  <li><strong>Kernel memory dumps</strong> (e.g. crash dumps) capture page contents, but NOACCESS pages have undefined/zeroed contents in dumps on most OS implementations.</li>
+</ul>
+</div>
+
+<div class="section">
+<h2 id="tiered-pools">Tiered Memory Pools</h2>
+<p>Pre-allocating a pool of slots avoids the overhead of calling <code>VirtualAlloc</code>/<code>mmap</code> on every inference. Tiered pools group slots by size to minimize wasted space (internal fragmentation):</p>
+
+<table class="params-table">
+  <thead><tr><th>Tier</th><th>Slot Size</th><th>Count</th><th>Best for</th></tr></thead>
+  <tbody>
+    <tr><td>Tier 1 — Small</td><td>4 MB</td><td>3 slots</td><td>Small layers (biases, BatchNorm, attention projections)</td></tr>
+    <tr><td>Tier 2 — Medium</td><td>32 MB</td><td>2 slots</td><td>Medium layers (hidden dimensions 256–4096)</td></tr>
+    <tr><td>Tier 3 — Large</td><td>max_layer_size</td><td>2 slots</td><td>Largest weight tensors (e.g. embedding tables, dense layers)</td></tr>
+  </tbody>
+</table>
+
+<p>With <code>use_shuffling=True</code>, the slot selected from each tier is random — so even if an attacker learns the virtual addresses of all slots from a previous run, the next run will use different addresses for different layers.</p>
+</div>
+
+<div class="section">
+<h2 id="hybrid-mode">Hybrid Mode — Dynamic Fallback</h2>
+<p>On memory-constrained servers (e.g. 8GB RAM shared across multiple model instances), pre-allocating a large pool may not be feasible. Hybrid mode detects this at runtime:</p>
+<pre><code><span class="cm"># At wrap time (secure_wrap_model):</span>
+avail_ram = pal_get_available_memory()
+pool_cost = max_layer_size * <span class="nu">4</span>   <span class="cm"># uniform pool estimate</span>
+<span class="kw">if</span> use_tiered_pools:
+    pool_cost = (<span class="nu">3</span> * <span class="nu">4</span>MB) + (<span class="nu">2</span> * <span class="nu">32</span>MB) + (<span class="nu">2</span> * max_layer_size)
+
+<span class="kw">if</span> max_layer_size > capped_pool_size <span class="kw">or</span> pool_cost > avail_ram * <span class="nu">0.20</span>:
+    <span class="cm"># Pool would consume >20% of available RAM — fall back to JIT</span>
+    use_shuffling_pool = <span class="kw">False</span>
+    print(<span class="st">"[Vajraa] Hybrid Fallback: Using standard JIT allocation"</span>)</code></pre>
+<p>In JIT mode, each inference call calls <code>pal_alloc_secure</code> and <code>pal_free_secure</code> directly. Slightly more overhead per call, but no upfront memory commitment.</p>
+</div>
+
+<div class="section">
+<h2 id="compaction">Dynamic Cache Compaction</h2>
+<p>Web servers handle bursty traffic — lots of requests for a few seconds, then nothing for minutes. Without compaction, the pre-allocated pool pages sit idle in RAM, wasting valuable memory that other processes could use.</p>
+
+<p>Vajraa addresses this with an <strong>idle-triggered daemon timer</strong>:</p>
+<ol style="color:var(--text-muted)">
+  <li>After every <code>release_slot()</code> call, the pool schedules a <code>threading.Timer(idle_timeout, compact)</code></li>
+  <li>If a new inference starts before the timer fires, the timer is cancelled</li>
+  <li>If no inference occurs for <code>idle_timeout</code> seconds, <code>compact()</code> fires:
+    <ul>
+      <li>For each un-leased slot: call <code>slot.free()</code> → <code>munmap(write_ptr) + munmap(read_ptr) + close(fd)</code></li>
+      <li>Clear the slots list</li>
+      <li>Set <code>is_initialized = False</code></li>
+      <li>Print <code>"[Vajraa] Dynamic Cache Compaction: Released idle memory pool slots."</code></li>
+    </ul>
+  </li>
+  <li>Next inference: <code>lease_slot()</code> detects <code>is_initialized = False</code>, calls <code>initialize()</code>, proceeds normally</li>
+</ol>
+
+<pre><code>config = <span class="nm">VajraaConfig</span>(
+    use_shuffling=<span class="kw">True</span>,
+    idle_timeout=<span class="nu">10.0</span>,   <span class="cm"># Release pages after 10 seconds of no inference</span>
+)
+
+<span class="cm"># For ONNX sessions, compaction happens in C++ via pal_compact_pool():</span>
+session = <span class="nm">SecureONNXSession</span>(model_path, license_path, customer_key, config=config)
+<span class="cm"># After idle_timeout seconds of no session.run() calls:</span>
+<span class="cm"># → dll.pal_compact_pool() is called</span>
+<span class="cm"># → All C++ pool pages released to OS</span></code></pre>
+</div>
+
+<div class="section">
+<h2 id="concurrent-models">Concurrent Models &amp; Web Servers</h2>
+<p>A common production pattern is running a web server that serves multiple users, potentially with multiple different models:</p>
+<pre><code><span class="cm"># FastAPI example — each model has its own wrapped instance</span>
+<span class="kw">from</span> <span class="nm">fastapi</span> <span class="kw">import</span> FastAPI
+<span class="kw">import</span> <span class="nm">torch</span>
+
+app = <span class="nm">FastAPI</span>()
+models = {}
+
+<span class="kw">def</span> <span class="fn">load_model</span>(model_id: str):
+    model = <span class="nm">MyModel</span>()
+    compiled = pickle.load(<span class="fn">open</span>(<span class="st">f"models/{model_id}.pkl"</span>, <span class="st">"rb"</span>))
+    config = <span class="nm">VajraaConfig</span>(
+        use_shuffling=<span class="kw">True</span>, 
+        use_tiered_pools=<span class="kw">True</span>,
+        use_hybrid_mode=<span class="kw">True</span>,
+        idle_timeout=<span class="nu">30.0</span>   <span class="cm"># free pages after 30s idle</span>
+    )
+    secure_wrap_model(model, compiled, master_key, config=config)
+    models[model_id] = model
+
+@app.post(<span class="st">"/infer/{model_id}"</span>)
+<span class="kw">async def</span> <span class="fn">infer</span>(model_id: str, data: dict):
+    <span class="kw">if</span> model_id <span class="kw">not in</span> models:
+        load_model(model_id)
+    <span class="kw">return</span> models[model_id](torch.tensor(data[<span class="st">"input"</span>])).tolist()</code></pre>
+
+<div class="callout callout-tip"><p><strong>💡 Concurrent request safety:</strong> <code>VajraaMemoryPool</code> uses <code>threading.Lock</code> to protect all slot operations. Concurrent requests to the same model will safely queue for slot availability — no race conditions on pool state.</p></div>
+</div>
+
+  </main>
+</div>
+
+<button class="back-to-top" id="back-to-top" title="Back to top">↑</button>
+<script src="assets/docs.js"></script>
+</body>
+</html>

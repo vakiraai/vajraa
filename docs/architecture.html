@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="Vajraa — AI Model Security Library documentation">
+<title>Architecture — Vajraa Docs</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<!-- TOP HEADER -->
+<header class="top-header">
+  <a href="index.html" class="logo-link">
+    <div class="logo-icon">V</div>
+    <span class="logo-text">Vajraa</span>
+    <span class="logo-badge">v1.0</span>
+  </a>
+  <div class="header-search">
+    <span class="search-icon">🔍</span>
+    <input type="text" id="search-input" placeholder="Search docs…">
+  </div>
+  <nav class="header-nav">
+    <a href="https://github.com/vakiraai/vajraa" target="_blank">GitHub</a>
+  </nav>
+</header>
+
+<div class="layout">
+  <nav class="sidebar">
+<span class="sidebar-label">Documentation</span>
+<a href="index.html" class="sidebar-link"><span class="icon">🏠</span>Home</a>
+<a href="getting-started.html" class="sidebar-link"><span class="icon">🚀</span>Getting Started</a>
+<a href="architecture.html" class="sidebar-link active"><span class="icon">🏛️</span>Architecture</a>
+<a href="flows.html" class="sidebar-link"><span class="icon">🔄</span>Flows</a>
+<a href="python-api.html" class="sidebar-link"><span class="icon">🐍</span>Python API</a>
+<a href="cpp-api.html" class="sidebar-link"><span class="icon">⚙️</span>C++ API</a>
+<a href="memory-security.html" class="sidebar-link"><span class="icon">🛡️</span>Memory Security</a>
+</nav>
+  <main class="main">
+    <div class="breadcrumb"><a href="index.html">Home</a><span class="sep">/</span><span class="current">Architecture</span></div>
+    
+<h1 class="page-title">System <span class="accent">Architecture</span></h1>
+<p class="page-subtitle">A layered walkthrough of every component — from the Python developer API down to OS virtual memory pages.</p>
+
+<div class="section">
+<h2 id="overview">Layer Overview</h2>
+<div class="arch-diagram"><pre class="layer-api">
+┌─────────────────────────────────────────────────────────────────────┐
+│                      DEVELOPER API LAYER                            │
+│  compile_model_weights()  │  rewrite_onnx_graph()                  │
+│  generate_license()       │  secure_wrap_model()                   │
+│  SecureONNXSession        │  VajraaConfig                          │
+└────────────┬──────────────────────────────────────┬────────────────┘
+             │                                      │</pre>
+<pre class="layer-rt">┌────────────▼──────────────┐         ┌──────────────▼──────────────┐
+│    PYTORCH RUNTIME        │         │    ONNX RUNTIME             │
+│  secure_wrap_model()      │         │  SecureONNXSession          │
+│  Pre / Post forward hooks │         │  C++ Custom Operators:      │
+│  VajraaMemoryPool         │         │   SecureGemmKernel          │
+│  VajraaMemorySlot         │         │   SecureConvKernel          │
+│  (write_ptr + read_ptr)   │         │   SecureConvTransposeKernel │
+└────────────┬──────────────┘         └──────────────┬──────────────┘
+             │                                       │</pre>
+<pre class="layer-crypto">             └──────────────────┬────────────────────┘
+                                │
+┌───────────────────────────────▼─────────────────────────────────────┐
+│                    CRYPTO ENGINE                                     │
+│  crypto.py                   │  crypto_engine.cpp                   │
+│  encrypt_tensor()            │  vajraa_decrypt_gcm()                │
+│  decrypt_tensor()            │  AES-256-GCM (OpenSSL on Linux/Mac) │
+│  generate_license()          │  AES-256-GCM (CNG/BCrypt on Windows)│
+│  decrypt_license()           │                                      │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │</pre>
+<pre class="layer-pal">┌───────────────────────────────▼─────────────────────────────────────┐
+│                  PLATFORM ABSTRACTION LAYER (PAL)                   │
+│  pal.h declares: pal_alloc_secure  pal_unlock  pal_lock             │
+│                  pal_secure_zero   pal_free_secure                  │
+│                  pal_store_key     pal_retrieve_key                 │
+│                  pal_configure_pool  pal_lease_secure_slot          │
+│                  pal_get_read_view   pal_compact_pool               │
+│                                                                     │
+│  pal_windows.cpp   pal_linux.cpp   pal_macos.cpp                   │
+│  pal_android.cpp   pal_embedded.c                                   │
+│                                                                     │
+│  OS Primitives:                                                     │
+│  Windows → VirtualAlloc / VirtualProtect / CreateFileMapping        │
+│  Linux   → mmap / mprotect / shm_open / /dev/urandom               │
+│  macOS   → mmap / mprotect / shm_open / PT_DENY_ATTACH             │
+└─────────────────────────────────────────────────────────────────────┘</pre>
+</div>
+</div>
+
+<div class="section">
+<h2 id="python-modules">Python Modules</h2>
+<table class="params-table">
+<thead><tr><th>File</th><th>Responsibility</th></tr></thead>
+<tbody>
+<tr><td><code>crypto.py</code></td><td>AES-256-GCM encrypt/decrypt for tensors and license blobs</td></tr>
+<tr><td><code>compiler.py</code></td><td>One-time compilation: encrypt + obfuscate + inject mixer weights</td></tr>
+<tr><td><code>base_shield.py</code></td><td>Simple JIT hook wrapping for all model layers (no pool)</td></tr>
+<tr><td><code>lora_shield.py</code></td><td>Same as base_shield but for LoRA adapter A/B weight matrices</td></tr>
+<tr><td><code>pytorch_wrapper.py</code></td><td>Advanced pooled JIT wrapping with VajraaConfig, double-mapping, compaction</td></tr>
+<tr><td><code>onnx_compiler.py</code></td><td>Rewrites ONNX graph: replaces Gemm/Conv with encrypted custom op nodes</td></tr>
+<tr><td><code>onnx_wrapper.py</code></td><td>SecureONNXSession: loads .ems, configures C++ pool, manages compaction timer</td></tr>
+<tr><td><code>pal.py</code></td><td>Python ctypes bridge to the native C++ shared library</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="section">
+<h2 id="cpp-modules">C++ Native Modules</h2>
+<table class="params-table">
+<thead><tr><th>File</th><th>Responsibility</th></tr></thead>
+<tbody>
+<tr><td><code>pal.h</code></td><td>C ABI header — all PAL function declarations</td></tr>
+<tr><td><code>pal_windows.cpp</code></td><td>Windows implementation using VirtualAlloc, VirtualProtect, DPAPI, CreateFileMapping</td></tr>
+<tr><td><code>pal_linux.cpp</code></td><td>Linux implementation using mmap, mprotect, shm_open, /dev/urandom</td></tr>
+<tr><td><code>pal_macos.cpp</code></td><td>macOS implementation using mmap, mprotect, shm_open, ptrace PT_DENY_ATTACH</td></tr>
+<tr><td><code>pal_android.cpp</code></td><td>Android/ARM variant (mmap, /dev/urandom)</td></tr>
+<tr><td><code>pal_embedded.c</code></td><td>Minimal C implementation for embedded targets (no OS memory APIs)</td></tr>
+<tr><td><code>crypto_engine.cpp</code></td><td>AES-256-GCM decryption using BCrypt (Windows) or OpenSSL (Linux/macOS)</td></tr>
+<tr><td><code>secure_gemm_op.cpp</code></td><td>ONNX Runtime custom operators: SecureGemm, SecureConv, SecureConvTranspose</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="section">
+<h2 id="memory-model">Memory Model — What Happens to Weights</h2>
+<pre><code>
+At REST (compiled model on disk):
+  ┌─────────────────┐
+  │  model.pkl      │  ← encrypted_layers: { "fc1.weight": { iv, ciphertext, tag } }
+  │  license.lic    │  ← master_key wrapped with customer_key (AES Key Wrap RFC 3394)
+  └─────────────────┘
+
+During INFERENCE (one forward pass):
+
+  Time →    │  pre_hook      │ layer.forward()  │ post_hook       │  idle
+  ──────────┼────────────────┼──────────────────┼─────────────────┼─────────
+  write_ptr │ READWRITE      │ NOACCESS         │ zeroed→NOACCESS │ NOACCESS
+  read_ptr  │ NOACCESS       │ READONLY         │ NOACCESS        │ NOACCESS
+  weights   │ decrypting     │ readable only    │ zeroed          │ gone
+  ──────────┼────────────────┼──────────────────┼─────────────────┼─────────
+
+  At no point are READWRITE and READABLE simultaneously accessible
+  from the same virtual address → defeats memory dump attacks
+</code></pre>
+</div>
+
+<div class="section">
+<h2 id="key-derivation">Key Derivation Hierarchy</h2>
+<pre><code>
+  master_key (32 bytes, random)
+       │
+       ├── SHA-256(master_key + "_crypto")  →  key_crypto
+       │   Used for: AES-256-GCM encrypt/decrypt of weight tensors
+       │
+       └── SHA-256(master_key + "_obfusc")  →  key_obfusc
+           Used for: deterministic permutation and scaling via seeded RNG
+               │
+               ├── SHA-256(key_obfusc + layer_name)       → permutation seed for output channels
+               ├── SHA-256(key_obfusc + layer_name+"_in") → permutation seed for input channels
+               └── SHA-256(key_obfusc + "mixer_" + name)  → mixer weight seed
+</code></pre>
+</div>
+
+<div class="section">
+<h2 id="build-system">Build System</h2>
+<p>The C++ extension uses CMake:</p>
+<pre><code><span class="cm"># CMakeLists.txt selects the correct PAL implementation at configure time:</span>
+<span class="kw">if</span>(WIN32)
+    target_sources(vajraa PRIVATE native/src/pal_windows.cpp)
+<span class="kw">elseif</span>(APPLE)
+    target_sources(vajraa PRIVATE native/src/pal_macos.cpp)
+<span class="kw">else</span>()
+    target_sources(vajraa PRIVATE native/src/pal_linux.cpp)
+<span class="kw">endif</span>()
+
+<span class="cm"># Always built regardless of platform:</span>
+target_sources(vajraa PRIVATE
+    native/src/crypto_engine.cpp
+    native/src/secure_gemm_op.cpp
+)</code></pre>
+<p>All PAL implementations expose the <strong>same C ABI</strong> declared in <code>pal.h</code> — so Python code and ONNX operators never call platform-specific functions directly.</p>
+</div>
+
+  </main>
+</div>
+
+<button class="back-to-top" id="back-to-top" title="Back to top">↑</button>
+<script src="assets/docs.js"></script>
+</body>
+</html>

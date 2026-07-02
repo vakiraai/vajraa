@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="Vajraa — AI Model Security Library documentation">
+<title>C++ API — Vajraa Docs</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<!-- TOP HEADER -->
+<header class="top-header">
+  <a href="index.html" class="logo-link">
+    <div class="logo-icon">V</div>
+    <span class="logo-text">Vajraa</span>
+    <span class="logo-badge">v1.0</span>
+  </a>
+  <div class="header-search">
+    <span class="search-icon">🔍</span>
+    <input type="text" id="search-input" placeholder="Search docs…">
+  </div>
+  <nav class="header-nav">
+    <a href="https://github.com/vakiraai/vajraa" target="_blank">GitHub</a>
+  </nav>
+</header>
+
+<div class="layout">
+  <nav class="sidebar">
+<span class="sidebar-label">Documentation</span>
+<a href="index.html" class="sidebar-link"><span class="icon">🏠</span>Home</a>
+<a href="getting-started.html" class="sidebar-link"><span class="icon">🚀</span>Getting Started</a>
+<a href="architecture.html" class="sidebar-link"><span class="icon">🏛️</span>Architecture</a>
+<a href="flows.html" class="sidebar-link"><span class="icon">🔄</span>Flows</a>
+<a href="python-api.html" class="sidebar-link"><span class="icon">🐍</span>Python API</a>
+<a href="cpp-api.html" class="sidebar-link active"><span class="icon">⚙️</span>C++ API</a>
+<a href="memory-security.html" class="sidebar-link"><span class="icon">🛡️</span>Memory Security</a>
+</nav>
+  <main class="main">
+    <div class="breadcrumb"><a href="index.html">Home</a><span class="sep">/</span><span class="current">C++ API</span></div>
+    
+<h1 class="page-title">C++ <span class="accent">API Reference</span></h1>
+<p class="page-subtitle">The Platform Abstraction Layer (PAL) and custom ONNX Runtime operators — every function documented.</p>
+
+<div class="callout callout-info"><p><strong>ℹ️ Note for freshers:</strong> You rarely need to call PAL functions directly from Python — that's handled by <code>pal.py</code>. This reference is for understanding what happens under the hood, or for contributing new platform implementations.</p></div>
+
+<div class="section">
+<h2 id="memory">Memory Allocation &amp; Protection</h2>
+
+<div class="fn-card">
+  <div class="fn-card-header">
+    <span class="fn-badge badge-cpp">C API</span>
+    <span class="fn-sig">void* pal_alloc_secure(size_t size)</span>
+  </div>
+  <div class="fn-card-body">
+    <p class="fn-desc">Allocates page-aligned, inaccessible memory. On all platforms, the returned pages are immediately set to <code>PAGE_NOACCESS</code> / <code>PROT_NONE</code> — meaning any access (read or write) before calling <code>pal_unlock</code> causes a segmentation fault / access violation.</p>
+    <table class="params-table">
+      <thead><tr><th>Platform</th><th>Implementation</th></tr></thead>
+      <tbody>
+        <tr><td>Windows</td><td><code>VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_NOACCESS)</code></td></tr>
+        <tr><td>Linux/macOS</td><td><code>mmap(NULL, size, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)</code></td></tr>
+      </tbody>
+    </table>
+    <p><strong>Returns:</strong> Pointer to allocated memory, or <code>NULL</code> on failure.</p>
+    <div class="callout callout-warn"><p><strong>⚠️ Always check for NULL!</strong> Secure allocations can fail under memory pressure. The callers always check <code>if (ptr == NULL)</code> before proceeding.</p></div>
+  </div>
+</div>
+
+<div class="fn-card">
+  <div class="fn-card-header">
+    <span class="fn-badge badge-cpp">C API</span>
+    <span class="fn-sig">bool pal_unlock(void* ptr, size_t size)</span>
+  </div>
+  <div class="fn-card-body">
+    <p class="fn-desc">Transitions pages from <code>NOACCESS</code> to <code>READWRITE</code>. Must be called before writing decrypted data into the buffer. Always followed by <code>pal_lock</code> as soon as writing is complete.</p>
+    <table class="params-table">
+      <thead><tr><th>Platform</th><th>Implementation</th></tr></thead>
+      <tbody>
+        <tr><td>Windows</td><td><code>VirtualProtect(ptr, size, PAGE_READWRITE, &amp;old_protect)</code></td></tr>
+        <tr><td>Linux/macOS</td><td><code>mprotect(ptr, size, PROT_READ | PROT_WRITE)</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="fn-card">
+  <div class="fn-card-header">
+    <span class="fn-badge badge-cpp">C API</span>
+    <span class="fn-sig">void pal_secure_zero(void* ptr, size_t size)</span>
+  </div>
+  <div class="fn-card-body">
+    <p class="fn-desc">Securely zeroes memory in a way that is <strong>guaranteed not to be optimized away by the compiler</strong>. Regular <code>memset</code> can be removed by an optimizing compiler if it determines the memory is never read afterwards — a dangerous silent omission in security code.</p>
+    <table class="params-table">
+      <thead><tr><th>Platform</th><th>Implementation</th></tr></thead>
+      <tbody>
+        <tr><td>Windows</td><td><code>RtlSecureZeroMemory(ptr, size)</code> — OS function guaranteed to execute</td></tr>
+        <tr><td>Linux</td><td><code>explicit_bzero(ptr, size)</code> — POSIX extension that cannot be optimized out</td></tr>
+        <tr><td>macOS</td><td>Volatile pointer loop: <code>volatile char* p = ptr; while(size--) *p++ = 0;</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+</div>
+
+<div class="section">
+<h2 id="anti-debug">Anti-Debugging &amp; Tamper Detection</h2>
+
+<div class="fn-card">
+  <div class="fn-card-header">
+    <span class="fn-badge badge-cpp">C API</span>
+    <span class="fn-sig">bool pal_is_debugger_attached(void)</span>
+  </div>
+  <div class="fn-card-body">
+    <p class="fn-desc">Queries the OS to determine if a debugger is present. Called at the start of every pre-hook to prevent live inspection of decrypted weights.</p>
+    <table class="params-table">
+      <thead><tr><th>Platform</th><th>Check</th></tr></thead>
+      <tbody>
+        <tr><td>Windows</td><td><code>IsDebuggerPresent()</code> + <code>CheckRemoteDebuggerPresent()</code> + DR0-DR3 hardware breakpoint check via NtQueryInformationThread</td></tr>
+        <tr><td>Linux</td><td>Parse <code>/proc/self/status</code> for <code>TracerPid:</code> (non-zero = debugger attached)</td></tr>
+        <tr><td>macOS</td><td><code>ptrace(PT_DENY_ATTACH, 0, 0, 0)</code> — prevents future attachment; sysctl check for P_TRACED</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="fn-card">
+  <div class="fn-card-header">
+    <span class="fn-badge badge-cpp">C API</span>
+    <span class="fn-sig">bool pal_timing_check(uint64_t* start_time)</span>
+  </div>
+  <div class="fn-card-body">
+    <p class="fn-desc">Detects step-through debugging by measuring execution time using CPU timestamp counters (RDTSC on x86). If a debugger is single-stepping instructions, the elapsed time between two calls exceeds a threshold that would be impossible without a debugger pausing execution.</p>
+    <p>Call pattern: <code>pal_timing_check(&amp;start)</code> before a critical block, then <code>pal_timing_check(&amp;start)</code> again after — if it returns <code>true</code>, terminate.</p>
+  </div>
+</div>
+
+<div class="fn-card">
+  <div class="fn-card-header">
+    <span class="fn-badge badge-cpp">C API</span>
+    <span class="fn-sig">void pal_kill_if_debugged(void)</span>
+  </div>
+  <div class="fn-card-body">
+    <p class="fn-desc">Immediately terminates the process. Does not print errors, does not call Python exit handlers — it uses the lowest-level OS kill available to prevent any teardown code from leaking state.</p>
+    <table class="params-table">
+      <thead><tr><th>Platform</th><th>Implementation</th></tr></thead>
+      <tbody>
+        <tr><td>Windows</td><td><code>ExitProcess(0xC0000005)</code> — STATUS_ACCESS_VIOLATION exit code</td></tr>
+        <tr><td>Linux/macOS</td><td><code>_exit(1)</code> — bypasses atexit handlers</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+</div>
+
+<div class="section">
+<h2 id="key-storage">Key Storage</h2>
+
+<div class="fn-card">
+  <div class="fn-card-header">
+    <span class="fn-badge badge-cpp">C API</span>
+    <span class="fn-sig">bool pal_store_key(const uint8_t* key, size_t len)</span>
+  </div>
+  <div class="fn-card-body">
+    <p class="fn-desc">Stores a key securely in process memory using OS-level protection mechanisms. The key is never stored in plain form in a C-level global variable.</p>
+    <table class="params-table">
+      <thead><tr><th>Platform</th><th>Implementation</th></tr></thead>
+      <tbody>
+        <tr><td>Windows</td><td><code>CryptProtectMemory</code> (DPAPI) — encrypts key in-place using a per-process OS-managed key. Only the same process context can decrypt it.</td></tr>
+        <tr><td>Linux/macOS</td><td>XOR split: generate random 32-byte <code>share1</code> from <code>/dev/urandom</code>. Compute <code>share2 = key XOR share1</code>. Store both shares separately. Neither alone reveals the key.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+</div>
+
+<div class="section">
+<h2 id="pool-api">Memory Pool API</h2>
+
+<div class="fn-card">
+  <div class="fn-card-header">
+    <span class="fn-badge badge-cpp">C API</span>
+    <span class="fn-sig">bool pal_configure_pool(bool use_shuffling, bool use_tiered, size_t capped_size, bool use_hybrid, size_t max_layer_size, size_t avail_ram)</span>
+  </div>
+  <div class="fn-card-body">
+    <p class="fn-desc">Initializes the C++ double-mapped page pool. Called once by <code>SecureONNXSession.__init__</code>. Applies hybrid logic: if <code>max_layer_size &gt; capped_size</code> or estimated pool memory exceeds 20% of available RAM, pooling is disabled and the library falls back to per-call JIT allocation.</p>
+  </div>
+</div>
+
+<div class="fn-card">
+  <div class="fn-card-header">
+    <span class="fn-badge badge-cpp">C API</span>
+    <span class="fn-sig">void* pal_lease_secure_slot(size_t required_size, size_t* allocated_size)</span>
+  </div>
+  <div class="fn-card-body">
+    <p class="fn-desc">Returns the write_ptr of a free pool slot large enough for <code>required_size</code> bytes. If <code>use_shuffling</code> is true, picks randomly from all qualifying slots — preventing attackers from predicting slot addresses across calls. If no slot is available, falls back to <code>pal_alloc_secure</code> (dynamic JIT allocation).</p>
+    <p><strong>Returns:</strong> Pointer to an READWRITE page (write view). <code>*allocated_size</code> is set to the actual slot size (may be larger than required_size).</p>
+  </div>
+</div>
+
+<div class="fn-card">
+  <div class="fn-card-header">
+    <span class="fn-badge badge-cpp">C API</span>
+    <span class="fn-sig">void* pal_get_read_view(void* write_ptr, size_t allocated_size)</span>
+  </div>
+  <div class="fn-card-body">
+    <p class="fn-desc">Performs the W→R page view transition. Finds the pool slot with matching <code>write_ptr</code>, sets the write view to <code>PROT_NONE</code>, sets the read view to <code>PROT_READ</code>, and returns the read view pointer. For dynamic (non-pooled) allocations, returns <code>write_ptr</code> unchanged (no double-mapping in JIT mode).</p>
+    <div class="callout callout-tip"><p><strong>💡 This is where W^R enforcement happens.</strong> After this call, attempting to write to write_ptr will cause an immediate segfault — so any rogue code trying to modify the weight post-decryption is caught by the OS.</p></div>
+  </div>
+</div>
+
+<div class="fn-card">
+  <div class="fn-card-header">
+    <span class="fn-badge badge-cpp">C API</span>
+    <span class="fn-sig">bool pal_compact_pool(void)</span>
+  </div>
+  <div class="fn-card-body">
+    <p class="fn-desc">Frees all currently un-leased slots, releases their OS memory (munmap / CloseHandle), removes them from the pool vector. If all slots are freed, <code>g_pool_initialized</code> is set to false. The next call to <code>pal_lease_secure_slot</code> will trigger re-initialization.</p>
+    <p>On Linux/macOS, this calls <code>munmap(write_ptr, size)</code> and <code>munmap(read_ptr, size)</code>, then <code>close(fd)</code> for each slot — fully returning the physical page frames to the OS.</p>
+  </div>
+</div>
+</div>
+
+<div class="section">
+<h2 id="custom-ops">ONNX Custom Operators (<code>secure_gemm_op.cpp</code>)</h2>
+<p>These operators are registered into ONNX Runtime's custom operator domain <code>"Vajraa"</code> via the <code>RegisterCustomOps</code> function which ONNX Runtime calls when the library is loaded.</p>
+
+<div class="fn-card">
+  <div class="fn-card-header">
+    <span class="fn-badge badge-cpp">C++ class</span>
+    <span class="fn-sig">struct SecureGemmKernel</span>
+  </div>
+  <div class="fn-card-body">
+    <p class="fn-desc">Implements <code>Vajraa.SecureGemm</code> — a matrix multiply operator that decrypts its weight matrix on every call, executes, and wipes. Replaces standard ONNX <code>Gemm</code> nodes.</p>
+    <h4>Compute(context) — full execution flow:</h4>
+    <ol style="color:var(--text-muted); padding-left: 22px;">
+      <li>If <code>!key_retrieved_</code>: call <code>pal_retrieve_key(master_key, 32)</code>, set flag to avoid re-retrieval on every call</li>
+      <li>Get input tensor (activations) from <code>context</code> input 0</li>
+      <li>Get encrypted weight bytes from input 1, IV from input 2, GCM tag from input 3</li>
+      <li>Call <code>pal_lease_secure_slot(ciphertext_len, &amp;allocated_size)</code> → <code>decrypted_weights_ptr</code></li>
+      <li>Call <code>vajraa_decrypt_gcm(..., decrypted_weights_ptr)</code> to decrypt directly into the write-view page</li>
+      <li>Call <code>pal_secure_zero(master_key, 32)</code> to wipe master key from stack</li>
+      <li>On decryption failure: release slot, return early (no partial result)</li>
+      <li>Call <code>pal_get_read_view(decrypted_weights_ptr, allocated_size)</code> → <code>read_weights_ptr</code></li>
+      <li>Cast: <code>const float* w_data = reinterpret_cast&lt;const float*&gt;(read_weights_ptr)</code></li>
+      <li>Get output tensor from context, execute OpenMP-parallelized matrix multiply</li>
+      <li>Call <code>pal_release_secure_slot(decrypted_weights_ptr, allocated_size)</code></li>
+    </ol>
+    <pre><code><span class="cm">// Simplified pseudocode:</span>
+<span class="kw">void</span> <span class="fn">Compute</span>(OrtKernelContext* context) {
+    <span class="kw">if</span> (!key_retrieved_) {
+        pal_retrieve_key(master_key, <span class="nu">32</span>);
+        key_retrieved_ = <span class="kw">true</span>;
+    }
+    <span class="kw">void</span>* write_ptr = pal_lease_secure_slot(ciphertext_len, &allocated_size);
+    vajraa_decrypt_gcm(ciphertext, len, master_key, iv, tag, write_ptr);
+    pal_secure_zero(master_key, <span class="nu">32</span>);
+    <span class="kw">void</span>* read_ptr = pal_get_read_view(write_ptr, allocated_size);
+    <span class="kw">const float</span>* w = <span class="kw">reinterpret_cast</span>&lt;<span class="kw">const float</span>*&gt;(read_ptr);
+    <span class="cm">// ... matrix multiply ...</span>
+    pal_release_secure_slot(write_ptr, allocated_size);
+}</code></pre>
+  </div>
+</div>
+
+<div class="fn-card">
+  <div class="fn-card-header">
+    <span class="fn-badge badge-cpp">C++ class</span>
+    <span class="fn-sig">struct SecureConvKernel</span>
+  </div>
+  <div class="fn-card-body">
+    <p class="fn-desc">Same decryption flow as SecureGemmKernel, but executes a 2D convolution instead of a matrix multiply. Strides, padding, and dilation attributes are cached in the kernel constructor to avoid re-reading per call.</p>
+  </div>
+</div>
+
+<div class="fn-card">
+  <div class="fn-card-header">
+    <span class="fn-badge badge-cpp">C++ class</span>
+    <span class="fn-sig">struct SecureConvTransposeKernel</span>
+  </div>
+  <div class="fn-card-body">
+    <p class="fn-desc">Same decryption flow, but executes a transposed convolution (deconvolution). Used for decoder/generator architectures (e.g. autoencoders, super-resolution models, GANs).</p>
+  </div>
+</div>
+</div>
+
+<div class="section">
+<h2 id="adding-platform">How to Add a New Platform</h2>
+<p>To add Vajraa support for a new OS (e.g. QNX, FreeBSD):</p>
+<ol style="color:var(--text-muted)">
+  <li>Create <code>native/src/pal_yourplatform.cpp</code></li>
+  <li>Implement ALL functions declared in <code>native/include/pal.h</code></li>
+  <li>Add your file to <code>CMakeLists.txt</code> under the correct platform detection block</li>
+  <li>Add platform detection in <code>python/vajraa/pal.py</code> (the <code>IS_*</code> variables)</li>
+  <li>Run the full test suite: <code>python -m unittest discover -s tests</code></li>
+</ol>
+<p>All PAL functions must maintain the same memory state machine: NOACCESS → READWRITE (write) → NOACCESS | READONLY (read) → NOACCESS (released).</p>
+</div>
+
+  </main>
+</div>
+
+<button class="back-to-top" id="back-to-top" title="Back to top">↑</button>
+<script src="assets/docs.js"></script>
+</body>
+</html>

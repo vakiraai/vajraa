@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="Vajraa — AI Model Security Library documentation">
+<title>Vajraa Docs — Vajraa Docs</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<!-- TOP HEADER -->
+<header class="top-header">
+  <a href="index.html" class="logo-link">
+    <div class="logo-icon">V</div>
+    <span class="logo-text">Vajraa</span>
+    <span class="logo-badge">v1.0</span>
+  </a>
+  <div class="header-search">
+    <span class="search-icon">🔍</span>
+    <input type="text" id="search-input" placeholder="Search docs…">
+  </div>
+  <nav class="header-nav">
+    <a href="https://github.com/vakiraai/vajraa" target="_blank">GitHub</a>
+  </nav>
+</header>
+
+<div class="layout">
+  <nav class="sidebar">
+<span class="sidebar-label">Documentation</span>
+<a href="index.html" class="sidebar-link active"><span class="icon">🏠</span>Home</a>
+<a href="getting-started.html" class="sidebar-link"><span class="icon">🚀</span>Getting Started</a>
+<a href="architecture.html" class="sidebar-link"><span class="icon">🏛️</span>Architecture</a>
+<a href="flows.html" class="sidebar-link"><span class="icon">🔄</span>Flows</a>
+<a href="python-api.html" class="sidebar-link"><span class="icon">🐍</span>Python API</a>
+<a href="cpp-api.html" class="sidebar-link"><span class="icon">⚙️</span>C++ API</a>
+<a href="memory-security.html" class="sidebar-link"><span class="icon">🛡️</span>Memory Security</a>
+</nav>
+  <main class="main">
+    <div class="breadcrumb"><span class="current">Home</span></div>
+    
+<h1 class="page-title"><span class="accent">Vajraa</span> — AI Model Security</h1>
+<p class="page-subtitle">Encrypt, protect, and distribute machine learning model weights — without ever exposing them to your customers or deployment servers.</p>
+
+<div class="cards-grid">
+  <a href="getting-started.html" class="card">
+    <div class="card-icon">🚀</div>
+    <div class="card-title">Getting Started</div>
+    <div class="card-desc">Install Vajraa and encrypt your first model in 5 minutes.</div>
+  </a>
+  <a href="architecture.html" class="card">
+    <div class="card-icon">🏛️</div>
+    <div class="card-title">Architecture</div>
+    <div class="card-desc">Understand the layered design — from Python API to OS memory pages.</div>
+  </a>
+  <a href="flows.html" class="card">
+    <div class="card-icon">🔄</div>
+    <div class="card-title">How It Works</div>
+    <div class="card-desc">Step-by-step flows for compilation, inference, and licensing.</div>
+  </a>
+  <a href="python-api.html" class="card">
+    <div class="card-icon">🐍</div>
+    <div class="card-title">Python API</div>
+    <div class="card-desc">Complete reference for every function in every Python module.</div>
+  </a>
+  <a href="cpp-api.html" class="card">
+    <div class="card-icon">⚙️</div>
+    <div class="card-title">C++ API</div>
+    <div class="card-desc">The Platform Abstraction Layer and custom ONNX operators.</div>
+  </a>
+  <a href="memory-security.html" class="card">
+    <div class="card-icon">🛡️</div>
+    <div class="card-title">Memory Security</div>
+    <div class="card-desc">W^R double-mapping, pool tiers, and dynamic cache compaction.</div>
+  </a>
+</div>
+
+<div class="section">
+<h2 id="what-is-vajraa">What is Vajraa?</h2>
+<p>Vajraa is a <strong>Python + native C++ library</strong> that solves one of the hardest problems in commercial AI deployment:</p>
+<blockquote style="border-left:3px solid var(--accent); padding-left:16px; margin:16px 0; color:var(--text-muted); font-style:italic;">
+"How do I give a customer access to my trained ML model without them being able to steal, copy, or reverse-engineer it?"
+</blockquote>
+<p>Traditional approaches (code obfuscation, DRM wrappers) all share one fatal weakness: the weights eventually end up in RAM in plain form, where a debugger or memory scanner can capture them.</p>
+<p>Vajraa solves this at the <strong>operating system memory page level</strong>:</p>
+<ul>
+  <li>Weights are <strong>never written to RAM in plain form</strong> — they are decrypted directly into OS page-locked memory, behind <code>PAGE_NOACCESS</code> protection.</li>
+  <li>A separate <strong>read-only virtual page view</strong> is created for execution — while the write view is simultaneously locked.</li>
+  <li>Weights are <strong>zero-wiped immediately</strong> after each forward pass.</li>
+  <li>Anti-debug sensors terminate the process if a debugger attaches.</li>
+</ul>
+</div>
+
+<div class="section">
+<h2 id="supported-platforms">Supported Platforms &amp; Frameworks</h2>
+<div class="cards-grid" style="grid-template-columns: repeat(auto-fit, minmax(150px,1fr));">
+  <div class="card"><div class="card-icon">🪟</div><div class="card-title">Windows</div><div class="card-desc">VirtualAlloc, DPAPI, CreateFileMapping</div></div>
+  <div class="card"><div class="card-icon">🐧</div><div class="card-title">Linux</div><div class="card-desc">mmap, /dev/urandom, shm_open</div></div>
+  <div class="card"><div class="card-icon">🍎</div><div class="card-title">macOS</div><div class="card-desc">mmap, shm_open, PT_DENY_ATTACH</div></div>
+  <div class="card"><div class="card-icon">🔦</div><div class="card-title">PyTorch</div><div class="card-desc">Forward hooks, JIT decryption</div></div>
+  <div class="card"><div class="card-icon">📦</div><div class="card-title">ONNX Runtime</div><div class="card-desc">Custom C++ operators</div></div>
+</div>
+</div>
+
+<div class="section">
+<h2 id="quick-example">Quick Example</h2>
+<pre><code><span class="cm"># ── Vendor side (offline, one-time) ──────────────────────────────────</span>
+<span class="kw">from</span> <span class="nm">vajraa</span> <span class="kw">import</span> compile_model_weights, generate_license
+<span class="kw">import</span> <span class="nm">os</span>, <span class="nm">pickle</span>
+
+master_key  = <span class="nm">os</span>.urandom(<span class="nu">32</span>)
+customer_key = <span class="nm">os</span>.urandom(<span class="nu">32</span>)   <span class="cm"># share this with customer securely</span>
+
+compiled = compile_model_weights(model.state_dict(), master_key)
+pickle.dump(compiled, <span class="fn">open</span>(<span class="st">"model_secured.pkl"</span>, <span class="st">"wb"</span>))
+
+lic = generate_license(<span class="st">"acme_corp"</span>, master_key, customer_key, expiry_days=<span class="nu">365</span>)
+<span class="fn">open</span>(<span class="st">"license.lic"</span>, <span class="st">"wb"</span>).write(lic)
+
+<span class="cm"># ── Customer / deployment side ────────────────────────────────────────</span>
+<span class="kw">from</span> <span class="nm">vajraa</span> <span class="kw">import</span> secure_wrap_model, VajraaConfig
+
+compiled   = pickle.load(<span class="fn">open</span>(<span class="st">"model_secured.pkl"</span>, <span class="st">"rb"</span>))
+config     = <span class="nm">VajraaConfig</span>(use_shuffling=<span class="kw">True</span>, use_tiered_pools=<span class="kw">True</span>, idle_timeout=<span class="nu">5.0</span>)
+secure_wrap_model(model, compiled, master_key, config=config)
+
+output = model(input_tensor)   <span class="cm"># weights decrypted JIT, wiped after</span></code></pre>
+</div>
+
+<div class="section">
+<h2 id="how-it-defends">What Attacks Does It Defend Against?</h2>
+<table class="params-table">
+<thead><tr><th>Attack Vector</th><th>Vajraa Defence</th></tr></thead>
+<tbody>
+<tr><td>Process memory dump</td><td>Weights only exist in NOACCESS pages between calls</td></tr>
+<tr><td>Debugger breakpoint on memory read</td><td>W^R double mapping — read and write views never overlap</td></tr>
+<tr><td>Live process inspection (IDA, x64dbg)</td><td>Anti-debug sensors (IsDebuggerPresent, RDTSC timing, ptrace)</td></tr>
+<tr><td>Weight file theft</td><td>Weights stored AES-256-GCM encrypted; master key inside signed license</td></tr>
+<tr><td>License sharing</td><td>License tied to customer_key; expiry timestamp enforced</td></tr>
+<tr><td>RAM retention after inference</td><td>Secure zero-wipe + OS page release after every forward pass</td></tr>
+<tr><td>Idle server memory scan</td><td>Dynamic cache compaction frees pages when server is idle</td></tr>
+</tbody>
+</table>
+</div>
+
+  </main>
+</div>
+
+<button class="back-to-top" id="back-to-top" title="Back to top">↑</button>
+<script src="assets/docs.js"></script>
+</body>
+</html>

@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="Vajraa — AI Model Security Library documentation">
+<title>Getting Started — Vajraa Docs</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<!-- TOP HEADER -->
+<header class="top-header">
+  <a href="index.html" class="logo-link">
+    <div class="logo-icon">V</div>
+    <span class="logo-text">Vajraa</span>
+    <span class="logo-badge">v1.0</span>
+  </a>
+  <div class="header-search">
+    <span class="search-icon">🔍</span>
+    <input type="text" id="search-input" placeholder="Search docs…">
+  </div>
+  <nav class="header-nav">
+    <a href="https://github.com/vakiraai/vajraa" target="_blank">GitHub</a>
+  </nav>
+</header>
+
+<div class="layout">
+  <nav class="sidebar">
+<span class="sidebar-label">Documentation</span>
+<a href="index.html" class="sidebar-link"><span class="icon">🏠</span>Home</a>
+<a href="getting-started.html" class="sidebar-link active"><span class="icon">🚀</span>Getting Started</a>
+<a href="architecture.html" class="sidebar-link"><span class="icon">🏛️</span>Architecture</a>
+<a href="flows.html" class="sidebar-link"><span class="icon">🔄</span>Flows</a>
+<a href="python-api.html" class="sidebar-link"><span class="icon">🐍</span>Python API</a>
+<a href="cpp-api.html" class="sidebar-link"><span class="icon">⚙️</span>C++ API</a>
+<a href="memory-security.html" class="sidebar-link"><span class="icon">🛡️</span>Memory Security</a>
+</nav>
+  <main class="main">
+    <div class="breadcrumb"><a href="index.html">Home</a><span class="sep">/</span><span class="current">Getting Started</span></div>
+    
+<h1 class="page-title">Getting <span class="accent">Started</span></h1>
+<p class="page-subtitle">A step-by-step guide for freshers — from installation to running your first secure inference in under 10 minutes.</p>
+
+<div class="section">
+<h2 id="prerequisites">Prerequisites</h2>
+<p>Before installing Vajraa, make sure you have the following:</p>
+<ul>
+  <li><strong>Python 3.9+</strong> — <a href="https://python.org">python.org</a></li>
+  <li><strong>PyTorch 2.0+</strong> — <a href="https://pytorch.org">pytorch.org</a></li>
+  <li><strong>ONNX Runtime</strong> (optional, for ONNX support) — <code>pip install onnxruntime</code></li>
+  <li><strong>cryptography</strong> — <code>pip install cryptography</code></li>
+  <li><strong>Visual Studio 2022 Build Tools</strong> (Windows) or <strong>GCC 11+</strong> (Linux) for the C++ extension</li>
+</ul>
+</div>
+
+<div class="section">
+<h2 id="installation">Installation</h2>
+<pre><code><span class="cm"># Clone the repository</span>
+git clone https://github.com/vakiraai/vajraa.git
+cd vajraa
+
+<span class="cm"># Build the native C++ library</span>
+cmake -B build -S .
+cmake --build build --config Release
+
+<span class="cm"># Copy the compiled DLL into the Python package</span>
+cp build/Release/vajraa.dll python/vajraa/    <span class="cm"># Windows</span>
+cp build/libvajraa.so python/vajraa/          <span class="cm"># Linux</span>
+cp build/libvajraa.dylib python/vajraa/       <span class="cm"># macOS</span>
+
+<span class="cm"># Install Python package</span>
+pip install -e python/</code></pre>
+</div>
+
+<div class="section">
+<h2 id="step1">Step 1 — Create and Train a Model</h2>
+<p>You need a trained PyTorch model. Here is a tiny example:</p>
+<pre><code><span class="kw">import</span> <span class="nm">torch</span>
+<span class="kw">import</span> <span class="nm">torch.nn</span> <span class="kw">as</span> <span class="nm">nn</span>
+
+<span class="kw">class</span> <span class="tp">MyModel</span>(nn.Module):
+    <span class="kw">def</span> <span class="fn">__init__</span>(self):
+        <span class="fn">super</span>().__init__()
+        self.fc1 = nn.Linear(<span class="nu">128</span>, <span class="nu">256</span>)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(<span class="nu">256</span>, <span class="nu">64</span>)
+        self.fc3 = nn.Linear(<span class="nu">64</span>, <span class="nu">10</span>)
+
+    <span class="kw">def</span> <span class="fn">forward</span>(self, x):
+        <span class="kw">return</span> self.fc3(self.relu(self.fc2(self.relu(self.fc1(x)))))
+
+model = <span class="nm">MyModel</span>()
+<span class="cm"># ... train model here ...</span></code></pre>
+</div>
+
+<div class="section">
+<h2 id="step2">Step 2 — Compile (Encrypt) the Model</h2>
+<p>This step is done <strong>once by the vendor</strong>, offline. It encrypts the model weights so they can never be read without the master key.</p>
+<pre><code><span class="kw">import</span> <span class="nm">os</span>, <span class="nm">pickle</span>
+<span class="kw">from</span> <span class="nm">vajraa.compiler</span> <span class="kw">import</span> compile_model_weights
+
+<span class="cm"># Generate a cryptographically-secure random 32-byte master key</span>
+master_key = os.urandom(<span class="nu">32</span>)
+
+<span class="cm"># Compile: encrypts first/last layers, obfuscates intermediate layers</span>
+compiled = compile_model_weights(model.state_dict(), master_key)
+
+<span class="cm"># Save to disk — this file can be distributed to customers</span>
+<span class="kw">with</span> <span class="fn">open</span>(<span class="st">"model_secured.pkl"</span>, <span class="st">"wb"</span>) <span class="kw">as</span> f:
+    pickle.dump(compiled, f)
+
+print(<span class="st">"✅ Encrypted layers:"</span>, <span class="fn">len</span>(compiled[<span class="st">"encrypted_layers"</span>]))
+print(<span class="st">"✅ Obfuscated layers:"</span>, <span class="fn">len</span>(compiled[<span class="st">"obfuscated_layers"</span>]))
+print(<span class="st">"✅ Max layer size:"</span>, compiled[<span class="st">"metadata"</span>][<span class="st">"max_layer_size_bytes"</span>], <span class="st">"bytes"</span>)</code></pre>
+<div class="callout callout-info"><p><strong>ℹ️ What happens inside?</strong> The compiler applies two protections: <strong>AES-256-GCM encryption</strong> to boundary layers (first and last), and <strong>channel permutation + scaling obfuscation</strong> to intermediate layers. See the <a href="flows.html">Flows</a> page for the full walkthrough.</p></div>
+</div>
+
+<div class="section">
+<h2 id="step3">Step 3 — Generate a License File</h2>
+<p>A license ties the model to a specific customer. It contains the master key, encrypted with the customer's own unique key.</p>
+<pre><code><span class="kw">from</span> <span class="nm">vajraa.crypto</span> <span class="kw">import</span> generate_license
+
+<span class="cm"># The customer_key is shared with the customer via a secure channel</span>
+customer_key = os.urandom(<span class="nu">32</span>)
+
+<span class="cm"># Create license — valid for 365 days</span>
+lic_bytes = generate_license(
+    customer_id=<span class="st">"acme_corp"</span>,
+    master_key=master_key,
+    customer_key=customer_key,
+    expiry_days=<span class="nu">365</span>
+)
+
+<span class="kw">with</span> <span class="fn">open</span>(<span class="st">"license.lic"</span>, <span class="st">"wb"</span>) <span class="kw">as</span> f:
+    f.write(lic_bytes)</code></pre>
+</div>
+
+<div class="section">
+<h2 id="step4">Step 4 — Secure Wrap for Inference (PyTorch)</h2>
+<p>On the customer's machine, load the compiled model and wrap it for secure inference. <strong>The customer never has access to the raw master key</strong> — it is unwrapped from the license file on the fly.</p>
+<pre><code><span class="kw">import</span> <span class="nm">pickle</span>
+<span class="kw">from</span> <span class="nm">vajraa.crypto</span> <span class="kw">import</span> decrypt_license
+<span class="kw">from</span> <span class="nm">vajraa.pytorch_wrapper</span> <span class="kw">import</span> secure_wrap_model, VajraaConfig
+
+<span class="cm"># Load compiled model (distributed by vendor)</span>
+<span class="kw">with</span> <span class="fn">open</span>(<span class="st">"model_secured.pkl"</span>, <span class="st">"rb"</span>) <span class="kw">as</span> f:
+    compiled = pickle.load(f)
+
+<span class="cm"># Decrypt license to get master_key</span>
+<span class="kw">with</span> <span class="fn">open</span>(<span class="st">"license.lic"</span>, <span class="st">"rb"</span>) <span class="kw">as</span> f:
+    lic_data = decrypt_license(f.read(), customer_key)
+master_key = lic_data[<span class="st">"master_key"</span>]
+
+<span class="cm"># Choose security profile</span>
+config = <span class="nm">VajraaConfig</span>(
+    use_shuffling=<span class="kw">True</span>,       <span class="cm"># random slot selection (prevents timing analysis)</span>
+    use_tiered_pools=<span class="kw">True</span>,    <span class="cm"># tiered memory buckets by size</span>
+    use_hybrid_mode=<span class="kw">True</span>,     <span class="cm"># auto-fall back to JIT if RAM is low</span>
+    idle_timeout=<span class="nu">5.0</span>,          <span class="cm"># release pages after 5s idle (web server mode)</span>
+)
+
+<span class="cm"># Attach secure hooks — model.forward() is now protected</span>
+secure_wrap_model(model, compiled, master_key, config=config)
+
+<span class="cm"># Run inference — weights decrypt JIT and are wiped immediately after</span>
+x = torch.randn(<span class="nu">1</span>, <span class="nu">128</span>)
+output = model(x)
+print(output.shape)   <span class="cm"># torch.Size([1, 10])</span></code></pre>
+</div>
+
+<div class="section">
+<h2 id="step5">Step 5 — ONNX Runtime Path</h2>
+<p>Alternatively, export your model to ONNX, rewrite it with Vajraa's encrypted operators, then run via <code>SecureONNXSession</code>.</p>
+<pre><code><span class="kw">import</span> <span class="nm">torch</span>
+<span class="kw">import</span> <span class="nm">numpy</span> <span class="kw">as</span> <span class="nm">np</span>
+<span class="kw">from</span> <span class="nm">vajraa.onnx_compiler</span> <span class="kw">import</span> rewrite_onnx_graph
+<span class="kw">from</span> <span class="nm">vajraa.onnx_wrapper</span> <span class="kw">import</span> SecureONNXSession
+
+<span class="cm"># Step A: Export to plain ONNX</span>
+torch.onnx.export(model, torch.randn(<span class="nu">1</span>,<span class="nu">128</span>), <span class="st">"model.onnx"</span>,
+                  input_names=[<span class="st">"input"</span>], output_names=[<span class="st">"output"</span>])
+
+<span class="cm"># Step B: Rewrite with encrypted operators (vendor side)</span>
+rewrite_onnx_graph(<span class="st">"model.onnx"</span>, <span class="st">"model.ems"</span>, master_key)
+
+<span class="cm"># Step C: Deploy — customer loads the secured model</span>
+session = <span class="nm">SecureONNXSession</span>(
+    model_path=<span class="st">"model.ems"</span>,
+    license_path=<span class="st">"license.lic"</span>,
+    customer_key=customer_key,
+    config=config
+)
+output = session.run([<span class="st">"output"</span>], {<span class="st">"input"</span>: np.random.randn(<span class="nu">1</span>,<span class="nu">128</span>).astype(<span class="st">"float32"</span>)})
+print(output[<span class="nu">0</span>].shape)</code></pre>
+</div>
+
+<div class="section">
+<h2 id="troubleshooting">Common Issues</h2>
+<table class="params-table">
+<thead><tr><th>Error</th><th>Cause</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td><code>FileNotFoundError: vajraa.dll</code></td><td>C++ library not built or not copied</td><td>Run <code>cmake --build build --config Release</code> then copy DLL</td></tr>
+<tr><td><code>SecurityError: License verification failed</code></td><td>Wrong customer_key or tampered license</td><td>Check you're using the same customer_key used to generate the license</td></tr>
+<tr><td><code>SecurityError: License has expired</code></td><td>expiry_days elapsed</td><td>Generate a new license with <code>generate_license(..., expiry_days=N)</code></td></tr>
+<tr><td><code>MemoryError: pal_alloc_secure failed</code></td><td>Insufficient memory or sandbox restriction</td><td>Enable <code>use_hybrid_mode=True</code> in VajraaConfig</td></tr>
+</tbody>
+</table>
+</div>
+
+  </main>
+</div>
+
+<button class="back-to-top" id="back-to-top" title="Back to top">↑</button>
+<script src="assets/docs.js"></script>
+</body>
+</html>

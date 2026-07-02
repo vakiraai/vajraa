@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="Vajraa — AI Model Security Library documentation">
+<title>Flows — Vajraa Docs</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<!-- TOP HEADER -->
+<header class="top-header">
+  <a href="index.html" class="logo-link">
+    <div class="logo-icon">V</div>
+    <span class="logo-text">Vajraa</span>
+    <span class="logo-badge">v1.0</span>
+  </a>
+  <div class="header-search">
+    <span class="search-icon">🔍</span>
+    <input type="text" id="search-input" placeholder="Search docs…">
+  </div>
+  <nav class="header-nav">
+    <a href="https://github.com/vakiraai/vajraa" target="_blank">GitHub</a>
+  </nav>
+</header>
+
+<div class="layout">
+  <nav class="sidebar">
+<span class="sidebar-label">Documentation</span>
+<a href="index.html" class="sidebar-link"><span class="icon">🏠</span>Home</a>
+<a href="getting-started.html" class="sidebar-link"><span class="icon">🚀</span>Getting Started</a>
+<a href="architecture.html" class="sidebar-link"><span class="icon">🏛️</span>Architecture</a>
+<a href="flows.html" class="sidebar-link active"><span class="icon">🔄</span>Flows</a>
+<a href="python-api.html" class="sidebar-link"><span class="icon">🐍</span>Python API</a>
+<a href="cpp-api.html" class="sidebar-link"><span class="icon">⚙️</span>C++ API</a>
+<a href="memory-security.html" class="sidebar-link"><span class="icon">🛡️</span>Memory Security</a>
+</nav>
+  <main class="main">
+    <div class="breadcrumb"><a href="index.html">Home</a><span class="sep">/</span><span class="current">How It Works</span></div>
+    
+<h1 class="page-title">How It <span class="accent">Works</span></h1>
+<p class="page-subtitle">Six complete walkthroughs — every step from model compilation to OS memory management.</p>
+
+<div class="section">
+<h2 id="flow1">Flow 1 — Model Compilation (Vendor Side, One-Time)</h2>
+<p>This step happens <strong>offline on the vendor's machine</strong>. No customer involvement. The output is a compiled model file and a license file that can be shipped to customers.</p>
+<div class="flow">
+  <div class="flow-step">
+    <div class="flow-dot" style="background:linear-gradient(135deg,#7c3aed,#06b6d4)">1</div>
+    <div class="flow-content">
+      <h4>Load model state_dict</h4>
+      <p>All weight tensors are read from the PyTorch model's <code>state_dict()</code>. Layer names are preserved (e.g. <code>fc1.weight</code>, <code>fc2.bias</code>).</p>
+    </div>
+  </div>
+  <div class="flow-step">
+    <div class="flow-dot" style="background:linear-gradient(135deg,#7c3aed,#06b6d4)">2</div>
+    <div class="flow-content">
+      <h4>Derive sub-keys</h4>
+      <p><code>key_crypto = SHA-256(master_key + "_crypto")</code> — used for AES encryption.<br>
+      <code>key_obfusc = SHA-256(master_key + "_obfusc")</code> — used for deterministic permutation seeding.</p>
+    </div>
+  </div>
+  <div class="flow-step">
+    <div class="flow-dot" style="background:linear-gradient(135deg,#7c3aed,#06b6d4)">3</div>
+    <div class="flow-content">
+      <h4>Boundary layers → AES-256-GCM encrypt</h4>
+      <p>The <strong>first and last layer</strong> weights are fully encrypted. These control the input/output representation and are the most sensitive. Encryption uses a random 12-byte IV per tensor.</p>
+    </div>
+  </div>
+  <div class="flow-step">
+    <div class="flow-dot" style="background:linear-gradient(135deg,#7c3aed,#06b6d4)">4</div>
+    <div class="flow-content">
+      <h4>Intermediate layers → Permute + Scale + Encrypt</h4>
+      <p>For each 2D weight matrix (Linear layers):<br>
+      1. Derive deterministic channel permutation <code>P_out</code>, <code>P_in</code> from <code>key_obfusc + layer_name</code>.<br>
+      2. Derive scaling vectors <code>S_out</code>, <code>S_in</code> (values in [0.5, 2.0]).<br>
+      3. Scramble: <code>W_scrambled = D_out · W[P_out, :][P_in, :] · D_in</code><br>
+      4. Then AES-256-GCM encrypt the scrambled tensor.</p>
+      <div class="callout callout-tip"><p><strong>💡 Why scramble AND encrypt?</strong> Scrambling is reversible (by the runtime) but makes the raw ciphertext uninformative even if decrypted with a wrong key — it just looks like a permuted version of unrelated weights.</p></div>
+    </div>
+  </div>
+  <div class="flow-step">
+    <div class="flow-dot" style="background:linear-gradient(135deg,#7c3aed,#06b6d4)">5</div>
+    <div class="flow-content">
+      <h4>Inject Secret Mixer weights</h4>
+      <p>For each obfuscated layer, a tiny <code>mix_size × mix_size</code> weight matrix is generated (seeded from <code>key_obfusc</code>) and AES-encrypted. At inference, <code>GeLU(X · W_mix)</code> is applied as a non-linear transformation after unscrambling — making the transformation harder to approximate without the key.</p>
+    </div>
+  </div>
+  <div class="flow-step">
+    <div class="flow-dot" style="background:linear-gradient(135deg,#7c3aed,#06b6d4)">6</div>
+    <div class="flow-content">
+      <h4>Build metadata</h4>
+      <p><code>max_layer_size_bytes</code> and per-layer sizes are tracked. This is used later to pre-size the memory pool without needing to inspect encrypted ciphertexts at runtime.</p>
+    </div>
+  </div>
+  <div class="flow-step">
+    <div class="flow-dot" style="background:linear-gradient(135deg,#7c3aed,#06b6d4)">7</div>
+    <div class="flow-content">
+      <h4>Generate license</h4>
+      <p>The master_key is wrapped using <strong>RFC 3394 AES Key Wrap</strong> with the customer_key. This wrapped key, plus customer_id and optional expiry timestamp, is then AES-256-GCM encrypted with the customer_key and serialized to JSON → bytes.</p>
+    </div>
+  </div>
+</div>
+</div>
+
+<div class="section">
+<h2 id="flow2">Flow 2 — PyTorch Secure Inference (Per Forward Pass)</h2>
+<pre><code>
+model(input)
+  │
+  ├─ [pre_hook fires for each wrapped layer]
+  │    1. pal_is_debugger_attached() → kill if true
+  │    2. decrypt_tensor(enc_weight, key_crypto) → weight_np
+  │    3. lease_slot() or pal_alloc_secure() → write_ptr
+  │    4. pal_unlock(write_ptr) → READWRITE
+  │    5. memmove(write_ptr ← weight_np bytes)
+  │    6. get_read_view() → copies write→read, locks write (NOACCESS)
+  │    7. torch.from_numpy(read_ptr buffer) → mod.weight (parameter)
+  │
+  ├─ [layer.forward() executes with torch ops reading mod.weight]
+  │
+  └─ [post_hook fires for each wrapped layer]
+       1. mod.weight_transient.zero_()  ← zero pytorch tensor
+       2. release_slot(slot)
+          └─ pal_unlock(write_ptr)
+             pal_secure_zero(write_ptr, size)  ← OS-guaranteed zero
+             pal_lock(write_ptr)  ← NOACCESS
+             pal_lock(read_ptr)   ← NOACCESS
+       3. del mod.weight, del mod.weight_transient
+       4. gc.collect()
+</code></pre>
+<div class="callout callout-warn"><p><strong>⚠️ Why gc.collect()?</strong> Python's garbage collector may not immediately release objects. <code>gc.collect()</code> forces the tensor's backing memory to be released before any potential memory scan can capture it.</p></div>
+</div>
+
+<div class="section">
+<h2 id="flow3">Flow 3 — ONNX Secure Inference (Per Operator Kernel Call)</h2>
+<p>For ONNX models, the C++ custom operator runs inside ONNX Runtime's thread pool. Each call is independent.</p>
+<pre><code>
+ONNX Runtime calls SecureGemmKernel::Compute(context):
+  │
+  ├─ if (!key_retrieved_):
+  │    pal_retrieve_key(master_key, 32)  ← reconstruct from XOR shares or DPAPI
+  │    key_retrieved_ = true
+  │
+  ├─ Extract inputs from context:
+  │    input_data  ← input tensor (e.g. activations)
+  │    w_enc_data  ← encrypted weight blob (ciphertext bytes)
+  │    iv_data     ← 12-byte IV
+  │    tag_data    ← 16-byte GCM authentication tag
+  │
+  ├─ pal_lease_secure_slot(ciphertext_len, &allocated_size)
+  │    → returns write_ptr (READWRITE, random slot from pool)
+  │
+  ├─ vajraa_decrypt_gcm(w_enc_data, len, master_key, iv, tag, write_ptr)
+  │    → decrypts directly into write_ptr
+  │
+  ├─ pal_secure_zero(master_key, 32)   ← wipe master_key from stack
+  │
+  ├─ pal_get_read_view(write_ptr, allocated_size)
+  │    → write_ptr page set NOACCESS
+  │    → read_ptr page set READONLY
+  │    → returns read_ptr
+  │
+  ├─ const float* w_data = reinterpret_cast&lt;const float*&gt;(read_ptr)
+  │
+  ├─ [OpenMP parallelized matrix multiply using w_data]
+  │
+  └─ pal_release_secure_slot(write_ptr, allocated_size)
+       → read_ptr set NOACCESS
+       → write_ptr unlocked, zeroed, re-locked NOACCESS
+       → slot.in_use = false
+</code></pre>
+</div>
+
+<div class="section">
+<h2 id="flow4">Flow 4 — License Verification</h2>
+<pre><code>
+license_bytes (from .lic file)
+  │
+  ▼
+JSON parse → { "iv": "...", "ciphertext": "...", "tag": "..." }
+  │
+  ▼
+AES-256-GCM decrypt with customer_key
+  │
+  ▼
+Inner JSON → { "customer_id": "acme_corp",
+               "master_key": "&lt;base64 AES-Key-Wrapped&gt;",
+               "expires_at": 1234567890.0 }
+  │
+  ├─ time.time() > expires_at? → raise SecurityError("License has expired")
+  │
+  ▼
+AES Key Unwrap (RFC 3394) with customer_key
+  → raw master_key bytes (32 bytes)
+  │
+  ▼
+Returns { "customer_id": "acme_corp", "master_key": b"..." }
+</code></pre>
+<div class="callout callout-info"><p><strong>ℹ️ Why AES Key Wrap?</strong> RFC 3394 AES Key Wrap is a NIST-standardized algorithm specifically designed to protect key material. It includes integrity checking — so if anyone tampers with the wrapped key bytes, unwrapping fails.</p></div>
+</div>
+
+<div class="section">
+<h2 id="flow5">Flow 5 — W^R Double-Mapped Virtual Memory</h2>
+<pre><code>
+Physical memory (OS kernel manages):
+  ┌──────────────────────────────────┐
+  │  Page frame #4A2F (4096 bytes)  │
+  └──────────────────────────────────┘
+            ▲               ▲
+            │               │
+  Virtual address 0x7F00  Virtual address 0x8B00
+  [write_ptr]             [read_ptr]
+  Both map to same physical page via:
+    Windows → CreateFileMapping + MapViewOfFile (x2)
+    Linux   → shm_open + ftruncate + mmap (x2)
+    macOS   → shm_open + ftruncate + mmap (x2)
+
+State machine per slot:
+
+  IDLE:       write_ptr=NOACCESS   read_ptr=NOACCESS
+  DECRYPTING: write_ptr=READWRITE  read_ptr=NOACCESS   ← pal_lease_secure_slot
+  EXECUTING:  write_ptr=NOACCESS   read_ptr=READONLY   ← pal_get_read_view
+  IDLE:       write_ptr=NOACCESS   read_ptr=NOACCESS   ← pal_release_secure_slot
+
+At no point are both views simultaneously accessible.
+A memory scanner searching for "readable + writable" pages finds nothing.
+</code></pre>
+</div>
+
+<div class="section">
+<h2 id="flow6">Flow 6 — Dynamic Cache Compaction</h2>
+<p>This is particularly important for web servers handling bursty inference traffic.</p>
+<pre><code>
+                        inference  inference                  inference
+                           │          │                          │
+Time →  ──────────────────┬──────────┬──────────────────────────┬────
+                           │          │                          │
+Pool:  INIT ──────────────[ACTIVE]──[ACTIVE]──────────────────[RE-INIT]
+                                          │
+                                          └── idle_timeout fires
+                                              compact() runs:
+                                              - munmap(write_ptr) per slot
+                                              - munmap(read_ptr)  per slot
+                                              - close(fd) per slot
+                                              - slots.clear()
+                                              - is_initialized = False
+                                              → OS reclaims all page frames
+</code></pre>
+<p>On the next inference call, <code>lease_slot()</code> detects <code>is_initialized = False</code>, calls <code>initialize()</code> (allocating new double-mapped slots), and proceeds normally. The re-initialization is transparent to the caller.</p>
+</div>
+
+  </main>
+</div>
+
+<button class="back-to-top" id="back-to-top" title="Back to top">↑</button>
+<script src="assets/docs.js"></script>
+</body>
+</html>

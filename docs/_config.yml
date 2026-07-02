@@ -1,0 +1,46 @@
+title: "Vajraa"
+description: "AI Model Security Library — Encrypt, protect, and distribute ML model weights"
+baseurl: "/vajra"
+url: "https://yourusername.github.io"
+
+theme: null
+plugins: []
+
+# Exclude build artifacts
+exclude:
+  - "*.py"
+  - "*.cpp"
+  - "*.h"
+  - "node_modules"
+  - "Gemfile"
+  - "Gemfile.lock"
+
+# Markdown
+markdown: kramdown
+kramdown:
+  input: GFM
+  hard_wrap: false
+
+# Collections
+collections:
+  docs:
+    output: true
+
+# Defaults
+defaults:
+  - scope:
+      path: "docs"
+      type: "pages"
+    values:
+      layout: "default"
+
+# SEO
+lang: en
+logo: assets/logo.png
+social:
+  name: Vajraa
+  links: []
+
+# GitHub metadata
+github:
+  is_project_page: true
